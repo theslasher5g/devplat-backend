@@ -36,20 +36,28 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     if (existing) return reply.code(409).send({ error: 'email_taken' });
 
     const passwordHash = await hashPassword(password);
+    // Users registering off a team invitation join that team instead of
+    // getting their own auto-created one.
+    const pendingInvite = await maybeOne(
+      'SELECT 1 FROM team_invites WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()',
+      [normalized],
+    );
     const user = await withTransaction(async (tx) => {
       const u = await tx.query<{ id: string }>(
         'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
         [normalized, passwordHash],
       );
       const userId = u.rows[0].id;
-      const team = await tx.query<{ id: string }>(
-        'INSERT INTO teams (name) VALUES ($1) RETURNING id',
-        [teamName?.trim() || normalized.split('@')[0]],
-      );
-      await tx.query(
-        "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')",
-        [team.rows[0].id, userId],
-      );
+      if (!pendingInvite) {
+        const team = await tx.query<{ id: string }>(
+          'INSERT INTO teams (name) VALUES ($1) RETURNING id',
+          [teamName?.trim() || normalized.split('@')[0]],
+        );
+        await tx.query(
+          "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')",
+          [team.rows[0].id, userId],
+        );
+      }
       return { id: userId };
     });
 
