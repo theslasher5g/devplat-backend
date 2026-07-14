@@ -1,0 +1,21 @@
+# Copy this service block into the existing /opt/devplat/docker-compose.yml
+# (do NOT run it as a separate compose file — one file per the repo conventions).
+# Assumes: external network `devplat_edge`, Traefik with docker provider and
+# exposedByDefault:false, Postgres service named `postgres`, this repo cloned
+# to /opt/devplat/backend.
+
+services:
+  api:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    depends_on:
+      - postgres
+    networks:
+      - devplat_edge
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`api.devplat.ch`)
+      - traefik.http.routers.api.entrypoints=websecure
+      - traefik.http.routers.api.tls.certresolver=letsencrypt
+      - traefik.http.services.api.loadbalancer.server.port=3000
