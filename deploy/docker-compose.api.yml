@@ -1,6 +1,8 @@
 # Copy this service block into the existing /opt/devplat/docker-compose.yml
 # (do NOT run it as a separate compose file — one file per the repo conventions).
-# Assumes: external network `devplat_edge`, Traefik with docker provider and
+# Assumes: the compose project defines a network key `edge` backed by the
+# external Docker network `devplat_edge` (see the `networks:` section at the
+# bottom of the VPS's docker-compose.yml), Traefik with docker provider and
 # exposedByDefault:false, Postgres service named `postgres`, this repo cloned
 # to /opt/devplat/backend.
 
@@ -12,7 +14,7 @@ services:
     depends_on:
       - postgres
     networks:
-      - devplat_edge
+      - edge
     labels:
       - traefik.enable=true
       - traefik.http.routers.api.rule=Host(`api.devplat.ch`)

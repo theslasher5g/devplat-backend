@@ -59,8 +59,9 @@ UPDATE users SET is_platform_admin = true WHERE email = 'you@devplat.dev';
 ## Deployment on the VPS
 
 Add the service to the existing `/opt/devplat/docker-compose.yml` (same file,
-same `devplat_edge` network, Traefik routing via labels only — see
-`deploy/docker-compose.api.yml` for the exact block to copy). Then:
+same `edge` network key (external network `devplat_edge`), Traefik routing via
+labels only — see `deploy/docker-compose.api.yml` for the exact block to
+copy). Then:
 
 ```bash
 cd /opt/devplat/backend && git pull && cd .. && docker compose up -d --build api
