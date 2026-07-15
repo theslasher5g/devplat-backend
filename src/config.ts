@@ -18,6 +18,17 @@ export const config = {
   jwtSecret: required('JWT_SECRET'),
   port: Number(process.env.PORT ?? 3000),
   host: process.env.HOST ?? '0.0.0.0',
+  // Per-VM resource allocation used for capacity math (least-loaded host
+  // selection, free-slot estimates). Matches the devplat-agent default —
+  // keep the two in sync if either changes.
+  vmVcpus: Number(process.env.VM_VCPUS ?? 1),
+  vmRamMb: Number(process.env.VM_RAM_MB ?? 2048),
+  // How many seconds an agent may go without a heartbeat before the
+  // scheduler marks its host offline and stops assigning new VMs to it.
+  agentHeartbeatTimeoutSeconds: Number(process.env.AGENT_HEARTBEAT_TIMEOUT_SECONDS ?? 90),
+  // Poll interval for the queue worker (retrying queued environment
+  // requests as capacity frees up) and the host health-check loop.
+  schedulerPollIntervalMs: Number(process.env.SCHEDULER_POLL_INTERVAL_MS ?? 5000),
   frontendUrl: (process.env.FRONTEND_URL ?? 'https://devplat.ch').replace(/\/$/, ''),
   apiUrl: (process.env.API_URL ?? 'https://api.devplat.ch').replace(/\/$/, ''),
   cookieDomain: process.env.COOKIE_DOMAIN || undefined,

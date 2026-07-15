@@ -24,6 +24,8 @@ declare module 'fastify' {
     membership: Membership;
     /** Set when the request authenticated with an API token instead of a session. */
     apiTokenTeamId?: string;
+    /** Set when the request authenticated with a devplat-agent host token. */
+    hostId?: string;
   }
 }
 
@@ -135,4 +137,29 @@ export async function requireApiTokenOrUser(req: FastifyRequest, reply: FastifyR
     return;
   }
   return requireMember(req, reply);
+}
+
+/**
+ * preHandler for devplat-agent → scheduler calls (currently just the
+ * heartbeat endpoint). The agent has no direct Postgres access — hosts run
+ * on separate hardware reachable only via WireGuard, and Postgres itself
+ * has no public port mapping — so this is the only channel for agents to
+ * report status, authenticated with the per-host shared secret issued at
+ * registration.
+ */
+export async function requireAgentToken(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+  const raw = bearerToken(req);
+  if (!raw?.startsWith('dvp_agent_')) {
+    reply.code(401).send({ error: 'agent_token_required' });
+    return reply;
+  }
+  const row = await maybeOne<{ id: string }>(
+    'SELECT id FROM hosts WHERE agent_token = $1',
+    [raw],
+  );
+  if (!row) {
+    reply.code(401).send({ error: 'invalid_agent_token' });
+    return reply;
+  }
+  req.hostId = row.id;
 }
