@@ -1,0 +1,39 @@
+{
+  "name": "devplat-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "devplat control-plane API: auth, teams, API tokens, Stripe billing, Resend email",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate": "tsx src/migrate.ts",
+    "seed": "tsx scripts/seed.ts",
+    "stripe:setup": "tsx scripts/stripe-setup.ts",
+    "test": "node --test --import tsx test/*.test.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.0.1",
+    "@react-email/components": "^0.0.36",
+    "@react-email/render": "^1.0.6",
+    "bcryptjs": "^3.0.2",
+    "fastify": "^5.2.1",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.14.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "resend": "^4.1.2",
+    "stripe": "^17.7.0"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.13.10",
+    "@types/pg": "^8.11.11",
+    "@types/react": "^19.0.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

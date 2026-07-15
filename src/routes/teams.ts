@@ -1,0 +1,167 @@
+import type { FastifyInstance } from 'fastify';
+import { PLAN_LIMITS, type PlanTier } from '../config.js';
+import { maybeOne, one, query, withTransaction } from '../db.js';
+import { sendTeamInviteEmail } from '../lib/email.js';
+import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
+import { requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser } from '../plugins/auth.js';
+
+export default async function teamRoutes(app: FastifyInstance): Promise<void> {
+  app.get('/teams/me', { preHandler: requireMember }, async (req) => {
+    const team = await one<{ id: string; name: string; plan_tier: PlanTier; trial_ends_at: string; created_at: string }>(
+      'SELECT id, name, plan_tier, trial_ends_at, created_at FROM teams WHERE id = $1',
+      [req.membership.teamId],
+    );
+    const members = await query<{ user_id: string; email: string; role: string; created_at: string }>(
+      `SELECT tm.user_id, u.email, tm.role, tm.created_at
+       FROM team_members tm JOIN users u ON u.id = tm.user_id
+       WHERE tm.team_id = $1 ORDER BY tm.created_at`,
+      [team.id],
+    );
+    const invites = await query<{ id: string; email: string; role: string; expires_at: string }>(
+      `SELECT id, email, role, expires_at FROM team_invites
+       WHERE team_id = $1 AND accepted_at IS NULL AND expires_at > now() ORDER BY created_at`,
+      [team.id],
+    );
+    return {
+      team: {
+        id: team.id,
+        name: team.name,
+        planTier: team.plan_tier,
+        planLabel: PLAN_LIMITS[team.plan_tier].label,
+        parallelLimit: PLAN_LIMITS[team.plan_tier].parallelEnvs,
+        trialEndsAt: team.trial_ends_at,
+        createdAt: team.created_at,
+        myRole: req.membership.role,
+      },
+      members: members.rows.map((m) => ({ userId: m.user_id, email: m.email, role: m.role, joinedAt: m.created_at })),
+      pendingInvites: invites.rows.map((i) => ({ id: i.id, email: i.email, role: i.role, expiresAt: i.expires_at })),
+    };
+  });
+
+  app.patch('/teams/me', {
+    preHandler: requireTeamAdmin,
+    schema: { body: { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 1, maxLength: 100 } } } },
+  }, async (req) => {
+    const { name } = req.body as { name: string };
+    await query('UPDATE teams SET name = $1 WHERE id = $2', [name.trim(), req.membership.teamId]);
+    return { ok: true };
+  });
+
+  // Parallelism limit for the (future) scheduler — reachable with an API token.
+  app.get('/teams/:id/limits', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const allowedTeamId = req.apiTokenTeamId ?? req.membership.teamId;
+    if (id !== allowedTeamId) return reply.code(403).send({ error: 'forbidden' });
+    const team = await maybeOne<{ plan_tier: PlanTier; trial_ends_at: string }>(
+      'SELECT plan_tier, trial_ends_at FROM teams WHERE id = $1', [id],
+    );
+    if (!team) return reply.code(404).send({ error: 'not_found' });
+    const trialExpired = team.plan_tier === 'free' && new Date(team.trial_ends_at) < new Date();
+    return {
+      teamId: id,
+      planTier: team.plan_tier,
+      parallelEnvironments: trialExpired ? 0 : PLAN_LIMITS[team.plan_tier].parallelEnvs,
+      trialExpired,
+    };
+  });
+
+  app.post('/teams/me/invites', {
+    preHandler: requireTeamAdmin,
+    schema: {
+      body: {
+        type: 'object',
+        required: ['email'],
+        properties: {
+          email: { type: 'string', format: 'email', maxLength: 255 },
+          role: { type: 'string', enum: ['admin', 'developer'] },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const { email, role = 'developer' } = req.body as { email: string; role?: 'admin' | 'developer' };
+    const normalized = email.trim().toLowerCase();
+    const teamId = req.membership.teamId;
+
+    const alreadyMember = await maybeOne(
+      `SELECT 1 FROM team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id = $1 AND u.email = $2`,
+      [teamId, normalized],
+    );
+    if (alreadyMember) return reply.code(409).send({ error: 'already_member' });
+
+    const { token, hash } = generateOneTimeToken();
+    await query('DELETE FROM team_invites WHERE team_id = $1 AND email = $2 AND accepted_at IS NULL', [teamId, normalized]);
+    await query(
+      `INSERT INTO team_invites (team_id, email, role, token_hash, invited_by, expires_at)
+       VALUES ($1, $2, $3, $4, $5, now() + interval '7 days')`,
+      [teamId, normalized, role, hash, req.user.id],
+    );
+    const team = await one<{ name: string }>('SELECT name FROM teams WHERE id = $1', [teamId]);
+    await sendTeamInviteEmail(normalized, token, team.name, req.user.email, role);
+    return reply.code(201).send({ ok: true });
+  });
+
+  // Invite details for the accept page (no auth: the token IS the credential).
+  app.get('/invites/:token', async (req, reply) => {
+    const { token } = req.params as { token: string };
+    const invite = await maybeOne<{ email: string; role: string; team_name: string }>(
+      `SELECT ti.email, ti.role, t.name AS team_name
+       FROM team_invites ti JOIN teams t ON t.id = ti.team_id
+       WHERE ti.token_hash = $1 AND ti.accepted_at IS NULL AND ti.expires_at > now()`,
+      [hashToken(token)],
+    );
+    if (!invite) return reply.code(404).send({ error: 'invalid_or_expired_invite' });
+    const existingUser = await maybeOne('SELECT 1 FROM users WHERE email = $1', [invite.email]);
+    return { email: invite.email, role: invite.role, teamName: invite.team_name, accountExists: !!existingUser };
+  });
+
+  // Accept as a logged-in user whose email matches the invite.
+  app.post('/invites/:token/accept', { preHandler: requireUser }, async (req, reply) => {
+    const { token } = req.params as { token: string };
+    const invite = await maybeOne<{ id: string; team_id: string; email: string; role: 'admin' | 'developer' }>(
+      `SELECT id, team_id, email, role FROM team_invites
+       WHERE token_hash = $1 AND accepted_at IS NULL AND expires_at > now()`,
+      [hashToken(token)],
+    );
+    if (!invite) return reply.code(404).send({ error: 'invalid_or_expired_invite' });
+    if (invite.email !== req.user.email) return reply.code(403).send({ error: 'invite_for_different_email' });
+    await withTransaction(async (tx) => {
+      await tx.query(
+        `INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
+         ON CONFLICT (team_id, user_id) DO NOTHING`,
+        [invite.team_id, req.user.id, invite.role],
+      );
+      await tx.query('UPDATE team_invites SET accepted_at = now() WHERE id = $1', [invite.id]);
+    });
+    return { ok: true, teamId: invite.team_id };
+  });
+
+  app.patch('/teams/me/members/:userId', {
+    preHandler: requireTeamAdmin,
+    schema: {
+      body: { type: 'object', required: ['role'], properties: { role: { type: 'string', enum: ['admin', 'developer'] } } },
+    },
+  }, async (req, reply) => {
+    const { userId } = req.params as { userId: string };
+    const { role } = req.body as { role: 'admin' | 'developer' };
+    const target = await maybeOne<{ role: string }>(
+      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+      [req.membership.teamId, userId],
+    );
+    if (!target) return reply.code(404).send({ error: 'not_a_member' });
+    if (target.role === 'owner') return reply.code(403).send({ error: 'cannot_change_owner' });
+    await query('UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3', [role, req.membership.teamId, userId]);
+    return { ok: true };
+  });
+
+  app.delete('/teams/me/members/:userId', { preHandler: requireTeamAdmin }, async (req, reply) => {
+    const { userId } = req.params as { userId: string };
+    const target = await maybeOne<{ role: string }>(
+      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+      [req.membership.teamId, userId],
+    );
+    if (!target) return reply.code(404).send({ error: 'not_a_member' });
+    if (target.role === 'owner') return reply.code(403).send({ error: 'cannot_remove_owner' });
+    await query('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [req.membership.teamId, userId]);
+    return { ok: true };
+  });
+}
