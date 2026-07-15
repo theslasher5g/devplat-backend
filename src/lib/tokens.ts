@@ -18,3 +18,11 @@ export function generateApiToken(scope: 'ci:run' | 'dev:run'): { token: string; 
   const token = `dvp_${kind}_${randomBytes(24).toString('base64url')}`;
   return { token, hash: hashToken(token), prefix: `${token.slice(0, 11)}…` };
 }
+
+/** Shared secret for a devplat-agent host, e.g. dvp_agent_9AfK… Used
+ *  bidirectionally (scheduler → agent calls, agent → scheduler heartbeat),
+ *  so — unlike api_tokens — this is stored in plaintext, not hashed; see
+ *  migrations/002_scheduler.sql for why. */
+export function generateAgentToken(): string {
+  return `dvp_agent_${randomBytes(32).toString('base64url')}`;
+}
