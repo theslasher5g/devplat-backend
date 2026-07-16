@@ -38,7 +38,7 @@ export function Layout({ preview, children }: { preview: string; children: React
           </Section>
           <Section style={{ padding: '16px 4px 0' }}>
             <Text style={{ margin: 0, fontFamily: monoStack, fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase' as const, color: colors.inkSoft }}>
-              devplat · CH-ZRH-1 · Zurich, Switzerland
+              devplat · CH-BSL-1 · Basel, Switzerland
             </Text>
           </Section>
         </Container>

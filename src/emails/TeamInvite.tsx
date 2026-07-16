@@ -10,7 +10,7 @@ export default function TeamInvite({ inviteUrl, teamName, inviterEmail, role }: 
       <Paragraph>
         {inviterEmail} invited you to join the team <strong>{teamName}</strong> as{' '}
         <strong>{role}</strong>. devplat runs your Testcontainers workloads on Firecracker
-        microVMs in Zurich — your tests stay where they are, the containers move to us.
+        microVMs in Basel — your tests stay where they are, the containers move to us.
       </Paragraph>
       <CtaButton href={inviteUrl}>Accept invitation</CtaButton>
       <Paragraph>The invitation is valid for 7 days.</Paragraph>

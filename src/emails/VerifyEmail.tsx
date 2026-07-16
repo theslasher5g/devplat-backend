@@ -7,7 +7,7 @@ export default function VerifyEmail({ verifyUrl }: { verifyUrl: string }) {
       <Heading>One click, and your account is live.</Heading>
       <Paragraph>
         Thanks for signing up for devplat — the remote backend for Testcontainers, hosted in
-        Zurich. Confirm your email address to activate your account. The link is valid for 24 hours.
+        Basel. Confirm your email address to activate your account. The link is valid for 24 hours.
       </Paragraph>
       <CtaButton href={verifyUrl}>Confirm email address</CtaButton>
       <Paragraph>

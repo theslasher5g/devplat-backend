@@ -41,7 +41,7 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
       `INSERT INTO hosts (name, location, agent_endpoint, wireguard_ip, agent_token, cpu_total, ram_total_mb, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'offline')
        RETURNING id`,
-      [body.name, body.location ?? 'CH-ZRH-1', body.agentEndpoint, body.wireguardIp, token, body.cpuTotal, body.ramTotalMb],
+      [body.name, body.location ?? 'CH-BSL-1', body.agentEndpoint, body.wireguardIp, token, body.cpuTotal, body.ramTotalMb],
     );
     // Put this into the agent's AGENT_TOKEN env on that host. It's shown
     // here once for convenience but — unlike api_tokens — remains readable
