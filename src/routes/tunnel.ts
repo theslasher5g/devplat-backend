@@ -61,11 +61,21 @@ export default async function tunnelRoutes(app: FastifyInstance): Promise<void> 
       const [host, portStr] = row.docker_endpoint.split(':');
       const port = Number(portStr);
 
-      tcp = net.connect({ host, port });
+      // A misrouted/black-holed docker_endpoint (e.g. the host can't
+      // forward packets to the VM's tap device) doesn't refuse the
+      // connection, it just never answers — without an explicit timeout
+      // this would hang the tunnel (and whatever's waiting on the other
+      // end of it, like `docker version`) indefinitely instead of failing.
+      tcp = net.connect({ host, port, timeout: 10_000 });
       tcp.on('connect', () => {
         tcpReady = true;
+        tcp!.setTimeout(0); // connected — no more use for the connect-phase timeout
         for (const buf of pending) tcp!.write(buf);
         pending.length = 0;
+      });
+      tcp.on('timeout', () => {
+        req.log.warn({ dockerEndpoint: row.docker_endpoint }, 'tunnel: docker endpoint connection timed out');
+        tcp!.destroy(new Error('connection to docker endpoint timed out'));
       });
       tcp.on('data', (chunk) => {
         if (socket.readyState === socket.OPEN) socket.send(chunk);
