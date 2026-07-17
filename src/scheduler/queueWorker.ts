@@ -1,5 +1,6 @@
-import { PLAN_LIMITS, type PlanTier } from '../config.js';
+import { type PlanTier } from '../config.js';
 import { query } from '../db.js';
+import { getPlan } from '../plans.js';
 import { tryAssign } from './allocator.js';
 
 /** Periodically retries queued environment requests as capacity frees up
@@ -29,12 +30,13 @@ export async function processQueue(): Promise<void> {
   }
 
   for (const r of queued.rows) {
+    const plan = getPlan(r.plan_tier);
     const trialExpired = r.plan_tier === 'free' && new Date(r.trial_ends_at) < new Date();
-    const limit = trialExpired ? 0 : PLAN_LIMITS[r.plan_tier].parallelEnvs;
+    const limit = trialExpired ? 0 : plan.parallelEnvs;
     const running = runningByTeam.get(r.team_id) ?? 0;
     if (running >= limit) continue;
 
-    const result = await tryAssign(r.id, r.team_id);
+    const result = await tryAssign(r.id, r.team_id, plan.vcpuPerEnv, plan.ramMbPerEnv);
     if (result?.status === 'assigned') {
       runningByTeam.set(r.team_id, running + 1);
     }

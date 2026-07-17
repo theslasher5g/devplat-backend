@@ -10,10 +10,16 @@ import hostRoutes from './routes/hosts.js';
 import teamRoutes from './routes/teams.js';
 import tokenRoutes from './routes/tokens.js';
 import webhookRoutes from './routes/webhooks.js';
+import { loadPlans } from './plans.js';
 import { startHealthPoller } from './scheduler/healthPoller.js';
 import { startQueueWorker } from './scheduler/queueWorker.js';
 
 export async function buildServer(): Promise<FastifyInstance> {
+  // Plan/tier data lives in the DB (plans table); load it into the typed
+  // cache before any route or scheduler loop reads it. migrate() has already
+  // run by the time buildServer() is called (see src/index.ts).
+  await loadPlans();
+
   const app = Fastify({
     logger: true,
     trustProxy: true, // behind Traefik

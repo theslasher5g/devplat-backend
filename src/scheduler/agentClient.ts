@@ -1,4 +1,3 @@
-import { config } from '../config.js';
 
 export interface AgentVm {
   vmId: string;
@@ -53,10 +52,10 @@ async function agentFetch<T>(
 export class AgentClient {
   constructor(private readonly endpoint: string, private readonly token: string) {}
 
-  async createVm(teamId: string, ttlMinutes: number): Promise<AgentVm> {
+  async createVm(teamId: string, ttlMinutes: number, vcpu: number, ramMb: number): Promise<AgentVm> {
     const res = await agentFetch<{ vm_id: string; docker_endpoint: string }>(
       this.endpoint, this.token, '/vms',
-      { method: 'POST', body: { team_id: teamId, ttl_minutes: ttlMinutes }, timeoutMs: 30_000 },
+      { method: 'POST', body: { team_id: teamId, ttl_minutes: ttlMinutes, vcpu, ram_mb: ramMb }, timeoutMs: 30_000 },
     );
     return { vmId: res.vm_id, dockerEndpoint: res.docker_endpoint };
   }
@@ -83,9 +82,14 @@ export function clientForHost(host: { agent_endpoint: string | null; agent_token
   return new AgentClient(host.agent_endpoint, host.agent_token);
 }
 
-/** Free VM slots on a host given devplat's per-VM sizing (config.vmVcpus/vmRamMb). */
-export function freeSlots(host: { cpu_total: number; cpu_used: number; ram_total_mb: number; ram_used_mb: number }): number {
-  const freeCpuSlots = Math.floor((host.cpu_total - host.cpu_used) / config.vmVcpus);
-  const freeRamSlots = Math.floor((host.ram_total_mb - host.ram_used_mb) / config.vmRamMb);
-  return Math.max(0, Math.min(freeCpuSlots, freeRamSlots));
+interface HostCapacity { cpu_total: number; cpu_used: number; ram_total_mb: number; ram_used_mb: number }
+
+/** Raw free CPU/RAM on a host. VMs are now variable-sized (per the requesting
+ *  team's plan), so capacity is tracked as raw resources, not fixed slots. */
+export function hostFreeCpu(host: HostCapacity): number { return host.cpu_total - host.cpu_used; }
+export function hostFreeRamMb(host: HostCapacity): number { return host.ram_total_mb - host.ram_used_mb; }
+
+/** Whether a host has room for a VM of the given size. */
+export function hostFits(host: HostCapacity, vcpu: number, ramMb: number): boolean {
+  return hostFreeCpu(host) >= vcpu && hostFreeRamMb(host) >= ramMb;
 }

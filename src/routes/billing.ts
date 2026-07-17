@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
-import { PLAN_LIMITS, config, type PlanTier } from '../config.js';
+import { config, type PlanTier } from '../config.js';
 import { maybeOne, one } from '../db.js';
+import { getPlan, maxFootprintGb } from '../plans.js';
 import { ensureStripeCustomer, requireStripe } from '../lib/stripe.js';
 import { requireTeamAdmin } from '../plugins/auth.js';
 
@@ -15,12 +16,15 @@ export default async function billingRoutes(app: FastifyInstance): Promise<void>
       'SELECT status, current_period_end, stripe_price_id FROM subscriptions WHERE team_id = $1',
       [req.membership.teamId],
     );
-    const limits = PLAN_LIMITS[team.plan_tier];
+    const plan = getPlan(team.plan_tier);
     return {
       planTier: team.plan_tier,
-      planLabel: limits.label,
-      parallelEnvironments: limits.parallelEnvs,
-      chfMonthly: limits.chfMonthly,
+      planLabel: plan.label,
+      parallelEnvironments: plan.parallelEnvs,
+      vcpuPerEnvironment: plan.vcpuPerEnv,
+      ramGbPerEnvironment: plan.ramMbPerEnv / 1024,
+      maxFootprintGb: maxFootprintGb(plan),
+      chfMonthly: plan.chfMonthly,
       trialEndsAt: team.plan_tier === 'free' ? team.trial_ends_at : null,
       subscription: sub
         ? { status: sub.status, currentPeriodEnd: sub.current_period_end, priceId: sub.stripe_price_id }

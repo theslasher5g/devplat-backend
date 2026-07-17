@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
-import { PLAN_LIMITS, type PlanTier } from '../config.js';
+import { type PlanTier } from '../config.js';
+import { getPlan } from '../plans.js';
 import { query } from '../db.js';
 import { requirePlatformAdmin } from '../plugins/auth.js';
 
@@ -46,8 +47,8 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         id: t.id,
         name: t.name,
         planTier: t.plan_tier,
-        planLabel: PLAN_LIMITS[t.plan_tier].label,
-        mrrChf: PLAN_LIMITS[t.plan_tier].chfMonthly,
+        planLabel: getPlan(t.plan_tier).label,
+        mrrChf: getPlan(t.plan_tier).chfMonthly,
         subscriptionStatus: t.status,
         currentPeriodEnd: t.current_period_end,
         members: Number(t.member_count),
@@ -76,7 +77,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     return {
       totalTeams: Number(teams.rows[0].count),
       activeSubscriptions: Number(activeSubs.rows[0].count),
-      mrrChf: mrr.rows.reduce((sum, r) => sum + PLAN_LIMITS[r.plan_tier].chfMonthly * Number(r.count), 0),
+      mrrChf: mrr.rows.reduce((sum, r) => sum + getPlan(r.plan_tier).chfMonthly * Number(r.count), 0),
       vmStarts7d: startCount,
       vmStartFailures7d: failCount,
       vmStartErrorRate7d: startCount + failCount > 0 ? failCount / (startCount + failCount) : null,

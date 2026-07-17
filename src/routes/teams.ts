@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
-import { PLAN_LIMITS, type PlanTier } from '../config.js';
+import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
+import { getPlan, maxFootprintGb } from '../plans.js';
 import { sendTeamInviteEmail } from '../lib/email.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser } from '../plugins/auth.js';
@@ -27,8 +28,11 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         id: team.id,
         name: team.name,
         planTier: team.plan_tier,
-        planLabel: PLAN_LIMITS[team.plan_tier].label,
-        parallelLimit: PLAN_LIMITS[team.plan_tier].parallelEnvs,
+        planLabel: getPlan(team.plan_tier).label,
+        parallelLimit: getPlan(team.plan_tier).parallelEnvs,
+        vcpuPerEnv: getPlan(team.plan_tier).vcpuPerEnv,
+        ramGbPerEnv: getPlan(team.plan_tier).ramMbPerEnv / 1024,
+        maxFootprintGb: maxFootprintGb(getPlan(team.plan_tier)),
         trialEndsAt: team.trial_ends_at,
         createdAt: team.created_at,
         myRole: req.membership.role,
@@ -57,10 +61,13 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     );
     if (!team) return reply.code(404).send({ error: 'not_found' });
     const trialExpired = team.plan_tier === 'free' && new Date(team.trial_ends_at) < new Date();
+    const plan = getPlan(team.plan_tier);
     return {
       teamId: id,
       planTier: team.plan_tier,
-      parallelEnvironments: trialExpired ? 0 : PLAN_LIMITS[team.plan_tier].parallelEnvs,
+      parallelEnvironments: trialExpired ? 0 : plan.parallelEnvs,
+      vcpuPerEnvironment: plan.vcpuPerEnv,
+      ramMbPerEnvironment: plan.ramMbPerEnv,
       trialExpired,
     };
   });

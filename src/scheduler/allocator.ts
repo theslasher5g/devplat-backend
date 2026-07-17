@@ -1,6 +1,7 @@
-import { PLAN_LIMITS, config, type PlanTier } from '../config.js';
+import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
-import { AgentError, clientForHost, freeSlots } from './agentClient.js';
+import { getPlan } from '../plans.js';
+import { AgentError, clientForHost, hostFits, hostFreeCpu } from './agentClient.js';
 
 export interface HostRow {
   id: string; name: string; agent_endpoint: string | null; agent_token: string | null;
@@ -28,23 +29,33 @@ async function runningCount(teamId: string): Promise<number> {
   return Number(row.count);
 }
 
-async function planLimit(teamId: string): Promise<number> {
+export interface EffectivePlan {
+  /** Parallel-environment cap for this team right now (0 if the trial lapsed). */
+  parallelEnvs: number;
+  /** Per-environment resource cap the scheduler enforces on the microVM. */
+  vcpu: number;
+  ramMb: number;
+}
+
+/** A team's current plan caps, with the free-trial-expiry rule applied. */
+async function effectivePlan(teamId: string): Promise<EffectivePlan> {
   const team = await one<{ plan_tier: PlanTier; trial_ends_at: string }>(
     'SELECT plan_tier, trial_ends_at FROM teams WHERE id = $1', [teamId],
   );
+  const plan = getPlan(team.plan_tier);
   const trialExpired = team.plan_tier === 'free' && new Date(team.trial_ends_at) < new Date();
-  return trialExpired ? 0 : PLAN_LIMITS[team.plan_tier].parallelEnvs;
+  return { parallelEnvs: trialExpired ? 0 : plan.parallelEnvs, vcpu: plan.vcpuPerEnv, ramMb: plan.ramMbPerEnv };
 }
 
-/** Hosts with spare capacity, most-free-first (least-loaded selection). */
-async function candidateHosts(): Promise<HostRow[]> {
+/** Hosts that can fit a VM of the given size, most-free-CPU first. */
+async function candidateHosts(vcpu: number, ramMb: number): Promise<HostRow[]> {
   const res = await query<HostRow>(
     `SELECT id, name, agent_endpoint, agent_token, cpu_total, cpu_used, ram_total_mb, ram_used_mb, status
      FROM hosts WHERE status = 'online' AND agent_endpoint IS NOT NULL AND agent_token IS NOT NULL`,
   );
   return res.rows
-    .filter((h) => freeSlots(h) > 0)
-    .sort((a, b) => freeSlots(b) - freeSlots(a) || a.name.localeCompare(b.name));
+    .filter((h) => hostFits(h, vcpu, ramMb))
+    .sort((a, b) => hostFreeCpu(b) - hostFreeCpu(a) || a.name.localeCompare(b.name));
 }
 
 /** Try to place a queued request on the best available host. Tries hosts in
@@ -52,32 +63,34 @@ async function candidateHosts(): Promise<HostRow[]> {
  *  it just moves to the next candidate. Returns false if nothing changed
  *  (no capacity, or every reachable host failed) so the caller/queue worker
  *  can leave it queued. */
-export async function tryAssign(requestId: string, teamId: string): Promise<EnvironmentResult | null> {
-  const hosts = await candidateHosts();
+export async function tryAssign(requestId: string, teamId: string, vcpu: number, ramMb: number): Promise<EnvironmentResult | null> {
+  const hosts = await candidateHosts(vcpu, ramMb);
   if (hosts.length === 0) return null;
 
   for (const host of hosts) {
     const client = clientForHost(host);
     if (!client) continue;
     try {
-      const vm = await client.createVm(teamId, DEFAULT_TTL_MINUTES);
+      const vm = await client.createVm(teamId, DEFAULT_TTL_MINUTES, vcpu, ramMb);
       return await withTransaction(async (tx) => {
         await tx.query(
           `UPDATE environment_requests
-           SET status = 'assigned', host_id = $1, vm_id = $2, docker_endpoint = $3, assigned_at = now()
-           WHERE id = $4`,
-          [host.id, vm.vmId, vm.dockerEndpoint, requestId],
+           SET status = 'assigned', host_id = $1, vm_id = $2, docker_endpoint = $3,
+               vcpu = $4, ram_mb = $5, assigned_at = now()
+           WHERE id = $6`,
+          [host.id, vm.vmId, vm.dockerEndpoint, vcpu, ramMb, requestId],
         );
         await tx.query(
           `INSERT INTO usage_events (team_id, host_id, vm_id, event_type, docker_endpoint, request_id)
            VALUES ($1, $2, $3, 'start', $4, $5)`,
           [teamId, host.id, vm.vmId, vm.dockerEndpoint, requestId],
         );
-        // Optimistic accounting — the health poller reconciles against the
-        // agent's own view every few seconds, so drift is self-correcting.
+        // Optimistic accounting with this VM's actual (plan-derived) size —
+        // the health poller reconciles against the agent's own view every few
+        // seconds, so drift is self-correcting.
         await tx.query(
           'UPDATE hosts SET cpu_used = cpu_used + $1, ram_used_mb = ram_used_mb + $2 WHERE id = $3',
-          [config.vmVcpus, config.vmRamMb, host.id],
+          [vcpu, ramMb, host.id],
         );
         return { requestId, status: 'assigned', hostId: host.id, vmId: vm.vmId, dockerEndpoint: vm.dockerEndpoint };
       });
@@ -103,12 +116,12 @@ export async function requestEnvironment(teamId: string): Promise<EnvironmentRes
     [teamId],
   );
 
-  const [limit, running] = await Promise.all([planLimit(teamId), runningCount(teamId)]);
-  if (running >= limit) {
+  const [plan, running] = await Promise.all([effectivePlan(teamId), runningCount(teamId)]);
+  if (running >= plan.parallelEnvs) {
     return { requestId: request.id, status: 'queued' };
   }
 
-  const result = await tryAssign(request.id, teamId);
+  const result = await tryAssign(request.id, teamId, plan.vcpu, plan.ramMb);
   if (result) return result;
 
   // Capacity existed on paper but every reachable host failed — leave it
@@ -117,8 +130,8 @@ export async function requestEnvironment(teamId: string): Promise<EnvironmentRes
 }
 
 export async function releaseEnvironment(teamId: string, requestId: string): Promise<{ ok: true } | { error: string }> {
-  const request = await maybeOne<{ id: string; host_id: string; vm_id: string }>(
-    "SELECT id, host_id, vm_id FROM environment_requests WHERE id = $1 AND team_id = $2 AND status = 'assigned'",
+  const request = await maybeOne<{ id: string; host_id: string; vm_id: string; vcpu: number | null; ram_mb: number | null }>(
+    "SELECT id, host_id, vm_id, vcpu, ram_mb FROM environment_requests WHERE id = $1 AND team_id = $2 AND status = 'assigned'",
     [requestId, teamId],
   );
   if (!request) return { error: 'not_found_or_not_assigned' };
@@ -150,9 +163,11 @@ export async function releaseEnvironment(teamId: string, requestId: string): Pro
        VALUES ($1, $2, $3, 'stop', $4)`,
       [teamId, request.host_id, request.vm_id, request.id],
     );
+    // Subtract exactly what assignment added (stored on the request row); the
+    // health poller reconciles against the agent's own view regardless.
     await tx.query(
       'UPDATE hosts SET cpu_used = GREATEST(0, cpu_used - $1), ram_used_mb = GREATEST(0, ram_used_mb - $2) WHERE id = $3',
-      [config.vmVcpus, config.vmRamMb, request.host_id],
+      [request.vcpu ?? 0, request.ram_mb ?? 0, request.host_id],
     );
   });
   return { ok: true };

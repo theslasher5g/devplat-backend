@@ -1,11 +1,7 @@
 export type PlanTier = 'free' | 'solo' | 'team' | 'scale';
 
-export const PLAN_LIMITS: Record<PlanTier, { parallelEnvs: number; chfMonthly: number; label: string }> = {
-  free: { parallelEnvs: 1, chfMonthly: 0, label: 'Free Trial' },
-  solo: { parallelEnvs: 2, chfMonthly: 29, label: 'Solo' },
-  team: { parallelEnvs: 5, chfMonthly: 79, label: 'Team' },
-  scale: { parallelEnvs: 15, chfMonthly: 199, label: 'Scale' },
-};
+// Plan/tier data (prices, parallelism, per-environment resource caps) lives in
+// the `plans` DB table and is accessed via src/plans.ts — not hardcoded here.
 
 function required(name: string): string {
   const v = process.env[name];
@@ -18,11 +14,9 @@ export const config = {
   jwtSecret: required('JWT_SECRET'),
   port: Number(process.env.PORT ?? 3000),
   host: process.env.HOST ?? '0.0.0.0',
-  // Per-VM resource allocation used for capacity math (least-loaded host
-  // selection, free-slot estimates). Matches the devplat-agent default —
-  // keep the two in sync if either changes.
-  vmVcpus: Number(process.env.VM_VCPUS ?? 1),
-  vmRamMb: Number(process.env.VM_RAM_MB ?? 2048),
+  // Per-VM sizing is no longer a global constant — it's the requesting team's
+  // plan cap (vcpu_per_environment / ram_gb_per_environment), looked up per
+  // request in the scheduler. See src/plans.ts and src/scheduler/allocator.ts.
   // How many seconds an agent may go without a heartbeat before the
   // scheduler marks its host offline and stops assigning new VMs to it.
   agentHeartbeatTimeoutSeconds: Number(process.env.AGENT_HEARTBEAT_TIMEOUT_SECONDS ?? 90),
