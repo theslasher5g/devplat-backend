@@ -134,11 +134,32 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       [hashToken(token)],
     );
     if (!row) return reply.code(400).send({ error: 'invalid_or_expired_token' });
-    await withTransaction(async (tx) => {
+    const joinedTeamIds = await withTransaction(async (tx) => {
       await tx.query('UPDATE users SET email_verified_at = now() WHERE id = $1 AND email_verified_at IS NULL', [row.user_id]);
       await tx.query('UPDATE verification_tokens SET used_at = now() WHERE id = $1', [row.id]);
+
+      // A user who registered off a team invite (see /auth/register's
+      // pendingInvite check) previously had to verify, sign in, THEN
+      // re-open the original invite link a second time to actually join —
+      // easy to lose track of. Auto-accept any pending invite(s) for this
+      // email right here instead, so verifying is the only step left.
+      const { rows: user } = await tx.query<{ email: string }>('SELECT email FROM users WHERE id = $1', [row.user_id]);
+      const { rows: invites } = await tx.query<{ id: string; team_id: string; role: 'admin' | 'developer' }>(
+        `SELECT id, team_id, role FROM team_invites
+         WHERE email = $1 AND accepted_at IS NULL AND expires_at > now()`,
+        [user[0].email],
+      );
+      for (const invite of invites) {
+        await tx.query(
+          `INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
+           ON CONFLICT (team_id, user_id) DO NOTHING`,
+          [invite.team_id, row.user_id, invite.role],
+        );
+        await tx.query('UPDATE team_invites SET accepted_at = now() WHERE id = $1', [invite.id]);
+      }
+      return invites.map((i) => i.team_id);
     });
-    return { ok: true };
+    return { ok: true, joinedTeamIds };
   });
 
   app.post('/auth/resend-verification', {

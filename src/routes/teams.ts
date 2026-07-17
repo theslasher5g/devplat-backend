@@ -110,15 +110,26 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   // Invite details for the accept page (no auth: the token IS the credential).
   app.get('/invites/:token', async (req, reply) => {
     const { token } = req.params as { token: string };
-    const invite = await maybeOne<{ email: string; role: string; team_name: string }>(
-      `SELECT ti.email, ti.role, t.name AS team_name
+    // Deliberately not filtering on accepted_at/expires_at here — an
+    // already-accepted invite (e.g. auto-accepted on email verification,
+    // see /auth/verify-email) needs to be told apart from a genuinely
+    // invalid/expired one, so whoever re-opens the link gets "you're
+    // already in" instead of a dead-end "ask for a new invite".
+    const invite = await maybeOne<{
+      email: string; role: string; team_name: string; accepted_at: string | null; expires_at: string;
+    }>(
+      `SELECT ti.email, ti.role, t.name AS team_name, ti.accepted_at, ti.expires_at
        FROM team_invites ti JOIN teams t ON t.id = ti.team_id
-       WHERE ti.token_hash = $1 AND ti.accepted_at IS NULL AND ti.expires_at > now()`,
+       WHERE ti.token_hash = $1`,
       [hashToken(token)],
     );
-    if (!invite) return reply.code(404).send({ error: 'invalid_or_expired_invite' });
+    const expired = !invite || (!invite.accepted_at && new Date(invite.expires_at) < new Date());
+    if (expired) return reply.code(404).send({ error: 'invalid_or_expired_invite' });
     const existingUser = await maybeOne('SELECT 1 FROM users WHERE email = $1', [invite.email]);
-    return { email: invite.email, role: invite.role, teamName: invite.team_name, accountExists: !!existingUser };
+    return {
+      email: invite.email, role: invite.role, teamName: invite.team_name,
+      accountExists: !!existingUser, alreadyAccepted: !!invite.accepted_at,
+    };
   });
 
   // Accept as a logged-in user whose email matches the invite.
