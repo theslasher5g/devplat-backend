@@ -136,6 +136,19 @@ export async function requestEnvironment(teamId: string): Promise<EnvironmentRes
 }
 
 export async function releaseEnvironment(teamId: string, requestId: string): Promise<{ ok: true } | { error: string }> {
+  // A request stuck in 'queued' (e.g. every candidate host was
+  // unreachable) never got a VM or host accounting — there's nothing to
+  // tear down, just stop the queue worker from retrying it. Conditioned
+  // on status = 'queued' in the UPDATE itself so a concurrent assignment
+  // (queue worker wins the race) can't get silently discarded here; if
+  // that happens this affects 0 rows and falls through to the normal
+  // assigned-release path below.
+  const releasedQueued = await maybeOne<{ id: string }>(
+    "UPDATE environment_requests SET status = 'released', released_at = now() WHERE id = $1 AND team_id = $2 AND status = 'queued' RETURNING id",
+    [requestId, teamId],
+  );
+  if (releasedQueued) return { ok: true };
+
   const request = await maybeOne<{ id: string; host_id: string; vm_id: string; vcpu: number | null; ram_mb: number | null }>(
     "SELECT id, host_id, vm_id, vcpu, ram_mb FROM environment_requests WHERE id = $1 AND team_id = $2 AND status = 'assigned'",
     [requestId, teamId],
