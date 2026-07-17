@@ -62,7 +62,11 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     });
 
     const token = await createOneTimeToken(user.id, 'verify_email');
-    await sendVerificationEmail(normalized, token);
+    // Best-effort: the account is already committed above, so a Resend
+    // outage/misconfiguration must not turn a successful signup into a 500.
+    await sendVerificationEmail(normalized, token).catch((err) => {
+      req.log.warn({ err }, 'verification email failed to send');
+    });
 
     return reply.code(201).send({ ok: true, message: 'verification_email_sent' });
   });
@@ -173,7 +177,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     // Always answer OK to avoid leaking which addresses have accounts.
     if (user && !user.email_verified_at) {
       const token = await createOneTimeToken(user.id, 'verify_email');
-      await sendVerificationEmail(user.email, token);
+      await sendVerificationEmail(user.email, token).catch((err) => {
+        req.log.warn({ err }, 'verification email failed to send');
+      });
     }
     return { ok: true };
   });
@@ -188,7 +194,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     );
     if (user) {
       const token = await createOneTimeToken(user.id, 'password_reset');
-      await sendPasswordResetEmail(user.email, token);
+      await sendPasswordResetEmail(user.email, token).catch((err) => {
+        req.log.warn({ err }, 'password reset email failed to send');
+      });
     }
     return { ok: true };
   });

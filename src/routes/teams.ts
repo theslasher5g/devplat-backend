@@ -103,7 +103,10 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
       [teamId, normalized, role, hash, req.user.id],
     );
     const team = await one<{ name: string }>('SELECT name FROM teams WHERE id = $1', [teamId]);
-    await sendTeamInviteEmail(normalized, token, team.name, req.user.email, role);
+    // Best-effort: the invite row is already committed above.
+    await sendTeamInviteEmail(normalized, token, team.name, req.user.email, role).catch((err) => {
+      req.log.warn({ err }, 'team invite email failed to send');
+    });
     return reply.code(201).send({ ok: true });
   });
 
