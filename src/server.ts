@@ -1,5 +1,6 @@
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
+import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { config } from './config.js';
 import adminRoutes from './routes/admin.js';
@@ -10,6 +11,7 @@ import environmentRoutes from './routes/environments.js';
 import hostRoutes from './routes/hosts.js';
 import teamRoutes from './routes/teams.js';
 import tokenRoutes from './routes/tokens.js';
+import tunnelRoutes from './routes/tunnel.js';
 import webhookRoutes from './routes/webhooks.js';
 import { loadPlans } from './plans.js';
 import { startHealthPoller } from './scheduler/healthPoller.js';
@@ -37,6 +39,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     methods: ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE'],
   });
   await app.register(cookie);
+  await app.register(websocket);
 
   app.setErrorHandler((rawErr, req, reply) => {
     const err = rawErr as Error & { code?: string; statusCode?: number; validation?: unknown };
@@ -64,6 +67,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(adminRoutes);
   await app.register(hostRoutes);
   await app.register(environmentRoutes);
+  await app.register(tunnelRoutes);
 
   // Scheduler background loops: retry queued environment requests as
   // capacity frees up, and poll agent health to keep hosts.status /
