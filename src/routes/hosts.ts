@@ -50,6 +50,35 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(201).send({ id: row.rows[0].id, name: body.name, agentToken: token });
   });
 
+  app.patch('/admin/hosts/:id', {
+    preHandler: requirePlatformAdmin,
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 100 },
+          location: { type: 'string', maxLength: 100 },
+          cpuTotal: { type: 'integer', minimum: 1 },
+          ramTotalMb: { type: 'integer', minimum: 1 },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = req.body as { name?: string; location?: string; cpuTotal?: number; ramTotalMb?: number };
+    const fields: string[] = [];
+    const values: unknown[] = [];
+    if (body.name !== undefined) { fields.push(`name = $${fields.length + 1}`); values.push(body.name); }
+    if (body.location !== undefined) { fields.push(`location = $${fields.length + 1}`); values.push(body.location); }
+    if (body.cpuTotal !== undefined) { fields.push(`cpu_total = $${fields.length + 1}`); values.push(body.cpuTotal); }
+    if (body.ramTotalMb !== undefined) { fields.push(`ram_total_mb = $${fields.length + 1}`); values.push(body.ramTotalMb); }
+    if (fields.length === 0) return reply.code(400).send({ error: 'no_fields' });
+    values.push(id);
+    const found = await maybeOne(`UPDATE hosts SET ${fields.join(', ')} WHERE id = $${fields.length + 1} RETURNING id`, values);
+    if (!found) return reply.code(404).send({ error: 'not_found' });
+    return { ok: true };
+  });
+
   app.post('/admin/hosts/:id/rotate-token', { preHandler: requirePlatformAdmin }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const token = generateAgentToken();

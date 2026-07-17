@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { type PlanTier } from '../config.js';
+import { config, type PlanTier } from '../config.js';
 import { getPlan } from '../plans.js';
 import { query, withTransaction } from '../db.js';
 import { requirePlatformAdmin } from '../plugins/auth.js';
@@ -118,6 +118,14 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     const mrr = await query<{ plan_tier: PlanTier; count: string }>(
       "SELECT plan_tier, count(*) FROM teams WHERE plan_tier != 'free' GROUP BY plan_tier",
     );
+    // A host counts as "connected" the same way the scheduler would treat it
+    // as usable: a heartbeat within the configured timeout. Previously this
+    // was hardcoded false, so the dashboard kept showing a "placeholder"
+    // badge even once real agents were heartbeating in.
+    const connected = await query<{ count: string }>(
+      `SELECT count(*) FROM hosts WHERE last_heartbeat > now() - ($1 || ' seconds')::interval`,
+      [String(config.agentHeartbeatTimeoutSeconds)],
+    );
     const startCount = Number(starts.rows[0].count);
     const failCount = Number(failures.rows[0].count);
     return {
@@ -129,7 +137,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       vmStartErrorRate7d: startCount + failCount > 0 ? failCount / (startCount + failCount) : null,
       // Requires the data plane's registry proxy — no source for this yet.
       cacheHitRate: null,
-      dataPlaneConnected: false,
+      dataPlaneConnected: Number(connected.rows[0].count) > 0,
     };
   });
 }
