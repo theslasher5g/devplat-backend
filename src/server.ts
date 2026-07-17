@@ -5,6 +5,7 @@ import { config } from './config.js';
 import adminRoutes from './routes/admin.js';
 import authRoutes from './routes/auth.js';
 import billingRoutes from './routes/billing.js';
+import contactRoutes from './routes/contact.js';
 import environmentRoutes from './routes/environments.js';
 import hostRoutes from './routes/hosts.js';
 import teamRoutes from './routes/teams.js';
@@ -49,6 +50,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get('/health', async () => ({ ok: true, service: 'devplat-api' }));
 
   await app.register(authRoutes);
+  await app.register(contactRoutes);
   await app.register(teamRoutes);
   await app.register(tokenRoutes);
   await app.register(billingRoutes);

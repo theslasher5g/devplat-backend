@@ -29,6 +29,8 @@ export const config = {
   isProd: process.env.NODE_ENV !== 'development' && !process.env.DEV,
   resendApiKey: process.env.RESEND_API_KEY ?? '',
   emailFrom: process.env.EMAIL_FROM ?? 'devplat <noreply@devplat.dev>',
+  // Where "Book a call" / contact-form submissions are sent as a notification.
+  contactEmail: process.env.CONTACT_EMAIL ?? 'hello@devplat.dev',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? '',
   stripePrices: {

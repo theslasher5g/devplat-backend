@@ -2,6 +2,7 @@ import { render } from '@react-email/render';
 import { Resend } from 'resend';
 import type { ReactElement } from 'react';
 import { config } from '../config.js';
+import ContactSubmission from '../emails/ContactSubmission.js';
 import ResetPassword from '../emails/ResetPassword.js';
 import TeamInvite from '../emails/TeamInvite.js';
 import VerifyEmail from '../emails/VerifyEmail.js';
@@ -34,4 +35,13 @@ export async function sendTeamInviteEmail(
 ): Promise<void> {
   const inviteUrl = `${config.frontendUrl}/invite?token=${token}`;
   await send(to, `Invitation: join ${teamName} on devplat`, TeamInvite({ inviteUrl, teamName, inviterEmail, role }), inviteUrl);
+}
+
+/** Notifies the contact inbox of a new "Book a call" / contact-form submission.
+ *  Best-effort: the caller already persisted the submission, so a Resend
+ *  outage here loses the notification, not the submission itself. */
+export async function sendContactNotification(payload: {
+  name: string; email: string; company?: string; message: string;
+}): Promise<void> {
+  await send(config.contactEmail, `New contact form message from ${payload.name}`, ContactSubmission(payload));
 }
