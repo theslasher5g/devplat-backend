@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { type PlanTier } from '../config.js';
 import { getPlan } from '../plans.js';
-import { query } from '../db.js';
+import { query, withTransaction } from '../db.js';
 import { requirePlatformAdmin } from '../plugins/auth.js';
 
 /**
@@ -84,7 +84,23 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     if (owner.rows[0].email_verified_at) {
       return reply.code(400).send({ error: 'owner_verified', detail: 'Refusing to delete a team whose owner has verified their email.' });
     }
-    await query('DELETE FROM teams WHERE id = $1', [id]);
+    await withTransaction(async (tx) => {
+      const members = await tx.query<{ user_id: string }>('SELECT user_id FROM team_members WHERE team_id = $1', [id]);
+      await tx.query('DELETE FROM teams WHERE id = $1', [id]);
+      // Also purge any member this team leaves as an orphaned, unverified
+      // user — otherwise their email stays "taken" forever with no way to
+      // sign up again, even though the team that email was tied to is gone.
+      // Never touches a verified user, even if this was their only team.
+      const memberIds = members.rows.map((m) => m.user_id);
+      if (memberIds.length > 0) {
+        await tx.query(
+          `DELETE FROM users
+             WHERE id = ANY($1) AND email_verified_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM team_members tm WHERE tm.user_id = users.id)`,
+          [memberIds],
+        );
+      }
+    });
     return reply.code(204).send();
   });
 
