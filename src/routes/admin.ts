@@ -32,13 +32,21 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     const res = await query<{
       id: string; name: string; plan_tier: PlanTier; created_at: string;
       status: string | null; current_period_end: string | null;
-      member_count: string; vm_starts_30d: string;
+      member_count: string; vm_starts_30d: string; owner_verified: boolean | null;
     }>(
       `SELECT t.id, t.name, t.plan_tier, t.created_at, s.status, s.current_period_end,
               (SELECT count(*) FROM team_members tm WHERE tm.team_id = t.id) AS member_count,
               (SELECT count(*) FROM usage_events ue
                 WHERE ue.team_id = t.id AND ue.event_type = 'start'
-                  AND ue.occurred_at > now() - interval '30 days') AS vm_starts_30d
+                  AND ue.occurred_at > now() - interval '30 days') AS vm_starts_30d,
+              -- The owner's verification status: registration creates the
+              -- team immediately and emails a verification link async, so an
+              -- owner who never clicks it (e.g. Resend not configured, email
+              -- lost) leaves a team here that looks identical to a real one
+              -- unless this is surfaced.
+              (SELECT u.email_verified_at IS NOT NULL FROM team_members tm
+                 JOIN users u ON u.id = tm.user_id
+                 WHERE tm.team_id = t.id AND tm.role = 'owner' LIMIT 1) AS owner_verified
        FROM teams t LEFT JOIN subscriptions s ON s.team_id = t.id
        ORDER BY t.created_at DESC`,
     );
@@ -54,6 +62,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         members: Number(t.member_count),
         vmStarts30d: Number(t.vm_starts_30d),
         createdAt: t.created_at,
+        ownerVerified: t.owner_verified ?? false,
       })),
     };
   });

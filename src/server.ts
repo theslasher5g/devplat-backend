@@ -29,6 +29,12 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(cors, {
     origin: [config.frontendUrl, 'http://localhost:5173'],
     credentials: true,
+    // @fastify/cors defaults `methods` to 'GET,HEAD,POST' — DELETE and PATCH
+    // (token/member/host revocation, team rename, environment release, ...)
+    // were silently blocked by the browser's preflight for every cross-origin
+    // request (frontend and API are different origins/subdomains even in
+    // prod) without ever reaching this server or throwing a visible error.
+    methods: ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE'],
   });
   await app.register(cookie);
 
