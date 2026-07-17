@@ -67,6 +67,27 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
+  // Cleanup for signups that never verified (e.g. Resend wasn't configured, or
+  // the owner just abandoned the flow) — refuses to touch a team whose owner
+  // has verified, so this can't be used to delete a live customer by mistake.
+  app.delete('/admin/teams/:id', { preHandler: requirePlatformAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const owner = await query<{ email_verified_at: string | null }>(
+      `SELECT u.email_verified_at FROM team_members tm
+         JOIN users u ON u.id = tm.user_id
+         WHERE tm.team_id = $1 AND tm.role = 'owner' LIMIT 1`,
+      [id],
+    );
+    if (owner.rows.length === 0) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    if (owner.rows[0].email_verified_at) {
+      return reply.code(400).send({ error: 'owner_verified', detail: 'Refusing to delete a team whose owner has verified their email.' });
+    }
+    await query('DELETE FROM teams WHERE id = $1', [id]);
+    return reply.code(204).send();
+  });
+
   app.get('/admin/overview', { preHandler: requirePlatformAdmin }, async () => {
     const [teams, activeSubs, starts, failures] = await Promise.all([
       query<{ count: string }>('SELECT count(*) FROM teams'),
