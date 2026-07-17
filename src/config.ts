@@ -28,9 +28,9 @@ export const config = {
   cookieDomain: process.env.COOKIE_DOMAIN || undefined,
   isProd: process.env.NODE_ENV !== 'development' && !process.env.DEV,
   resendApiKey: process.env.RESEND_API_KEY ?? '',
-  emailFrom: process.env.EMAIL_FROM ?? 'devplat <noreply@devplat.dev>',
+  emailFrom: process.env.EMAIL_FROM ?? 'devplat <noreply@devplat.ch>',
   // Where "Book a call" / contact-form submissions are sent as a notification.
-  contactEmail: process.env.CONTACT_EMAIL ?? 'hello@devplat.dev',
+  contactEmail: process.env.CONTACT_EMAIL ?? 'hello@devplat.ch',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? '',
   stripePrices: {
