@@ -3,8 +3,9 @@ import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { getPlan, maxFootprintGb } from '../plans.js';
 import { sendTeamInviteEmail } from '../lib/email.js';
+import { stripe } from '../lib/stripe.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
-import { requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser } from '../plugins/auth.js';
+import { SESSION_COOKIE, requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser, sessionCookieOptions } from '../plugins/auth.js';
 
 export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   app.get('/teams/me', { preHandler: requireMember }, async (req) => {
@@ -49,6 +50,48 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     const { name } = req.body as { name: string };
     await query('UPDATE teams SET name = $1 WHERE id = $2', [name.trim(), req.membership.teamId]);
     return { ok: true };
+  });
+
+  // Self-service "delete my team" — owner only, since it also wipes every
+  // member's account, not just the caller's.
+  app.delete('/teams/me', { preHandler: requireMember }, async (req, reply) => {
+    if (req.membership.role !== 'owner') {
+      return reply.code(403).send({ error: 'owner_required', detail: 'Only the team owner can delete the team.' });
+    }
+    const teamId = req.membership.teamId;
+
+    // Best-effort: stop billing before the team (and its Stripe customer
+    // link) disappears. A failure here is logged, not fatal — the owner's
+    // right to delete their account shouldn't be blocked by Stripe being
+    // briefly unreachable.
+    const sub = await maybeOne<{ stripe_subscription_id: string; status: string }>(
+      'SELECT stripe_subscription_id, status FROM subscriptions WHERE team_id = $1',
+      [teamId],
+    );
+    if (sub && stripe && !['canceled', 'incomplete_expired'].includes(sub.status)) {
+      await stripe.subscriptions.cancel(sub.stripe_subscription_id).catch((err) => {
+        req.log.warn({ err }, 'failed to cancel stripe subscription during team self-delete');
+      });
+    }
+
+    await withTransaction(async (tx) => {
+      const members = await tx.query<{ user_id: string }>('SELECT user_id FROM team_members WHERE team_id = $1', [teamId]);
+      await tx.query('DELETE FROM teams WHERE id = $1', [teamId]);
+      // Every member's account goes too — this is the owner deleting their
+      // whole team, not admin cleanup, so verified status doesn't matter.
+      // Still spared: anyone who also belongs to a different team, since
+      // deleting this team shouldn't reach into a membership elsewhere.
+      const memberIds = members.rows.map((m) => m.user_id);
+      if (memberIds.length > 0) {
+        await tx.query(
+          `DELETE FROM users
+             WHERE id = ANY($1) AND NOT EXISTS (SELECT 1 FROM team_members tm WHERE tm.user_id = users.id)`,
+          [memberIds],
+        );
+      }
+    });
+
+    return reply.clearCookie(SESSION_COOKIE, { ...sessionCookieOptions(), maxAge: undefined }).send({ ok: true });
   });
 
   // Parallelism limit for the (future) scheduler — reachable with an API token.
