@@ -96,12 +96,18 @@ export async function tryAssign(requestId: string, teamId: string, vcpu: number,
       });
     } catch (err) {
       const message = err instanceof AgentError ? err.message : (err as Error).message;
+      // fetch()'s own errors (undici) nest the actual OS-level cause
+      // (ECONNREFUSED, ENOTFOUND, ...) two levels down and Node doesn't
+      // print it by default — "fetch failed" alone isn't enough to debug a
+      // host that's unreachable, so surface the real cause explicitly.
+      const cause = err instanceof AgentError ? err.cause : undefined;
+      const rootCause = cause instanceof Error && cause.cause instanceof Error ? cause.cause.message : undefined;
       await query(
         `INSERT INTO usage_events (team_id, host_id, event_type) VALUES ($1, $2, 'start_failed')`,
         [teamId, host.id],
       );
       // eslint-disable-next-line no-console
-      console.warn(`[scheduler] createVm failed on host ${host.name}: ${message}`);
+      console.warn(`[scheduler] createVm failed on host ${host.name}: ${message}${rootCause ? ` (${rootCause})` : ''}`);
       // fall through to the next candidate host
     }
   }
