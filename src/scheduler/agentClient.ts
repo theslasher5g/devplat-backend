@@ -53,13 +53,12 @@ export class AgentClient {
   constructor(private readonly endpoint: string, private readonly token: string) {}
 
   async createVm(teamId: string, ttlMinutes: number, vcpu: number, ramMb: number): Promise<AgentVm> {
-    // Must clear the agent's own handler timeout (120s, temporarily, while
-    // diagnosing a suspected slow dockerd startup in the guest — see
-    // devplat-agent's server.go) with margin, or this side gives up and
-    // aborts a request that would've succeeded a bit later on the agent.
+    // Must clear the agent's own handler timeout (45s — see devplat-agent's
+    // server.go) with margin, or this side gives up and aborts a request
+    // that would've succeeded a few seconds later on the agent.
     const res = await agentFetch<{ vm_id: string; docker_endpoint: string }>(
       this.endpoint, this.token, '/vms',
-      { method: 'POST', body: { team_id: teamId, ttl_minutes: ttlMinutes, vcpu, ram_mb: ramMb }, timeoutMs: 140_000 },
+      { method: 'POST', body: { team_id: teamId, ttl_minutes: ttlMinutes, vcpu, ram_mb: ramMb }, timeoutMs: 60_000 },
     );
     return { vmId: res.vm_id, dockerEndpoint: res.docker_endpoint };
   }
