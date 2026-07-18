@@ -1,12 +1,14 @@
 import { type PlanTier } from '../config.js';
 import { query } from '../db.js';
 import { getPlan } from '../plans.js';
-import { tryAssign } from './allocator.js';
+import { reclaimStaleAssignments, tryAssign } from './allocator.js';
 
 /** Periodically retries queued environment requests as capacity frees up
  *  (a released VM, a host coming back online, or new capacity registered).
  *  Bounded batch per tick so one noisy team can't starve others. */
 export async function processQueue(): Promise<void> {
+  await reclaimStaleAssignments();
+
   const queued = await query<{ id: string; team_id: string; plan_tier: PlanTier; trial_ends_at: string }>(
     `SELECT er.id, er.team_id, t.plan_tier, t.trial_ends_at
      FROM environment_requests er JOIN teams t ON t.id = er.team_id

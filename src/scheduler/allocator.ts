@@ -79,7 +79,7 @@ export async function tryAssign(requestId: string, teamId: string, vcpu: number,
   // as createVm() was slow enough to reliably blow past every timeout layer
   // (it just failed instead of racing) — fixing that unmasked this bug.
   const claimed = await maybeOne<{ id: string }>(
-    "UPDATE environment_requests SET status = 'assigning' WHERE id = $1 AND status = 'queued' RETURNING id",
+    "UPDATE environment_requests SET status = 'assigning', claimed_at = now() WHERE id = $1 AND status = 'queued' RETURNING id",
     [requestId],
   );
   if (!claimed) return null; // already claimed by a concurrent attempt
@@ -144,6 +144,22 @@ export async function tryAssign(requestId: string, teamId: string, vcpu: number,
   // 'assigning' forever.
   await query("UPDATE environment_requests SET status = 'queued' WHERE id = $1 AND status = 'assigning'", [requestId]);
   return null;
+}
+
+/** Revert any 'assigning' claim that's been sitting for too long back to
+ *  'queued' so the worker retries it. tryAssign()'s own revert-on-failure
+ *  only runs if that same process lives long enough to reach it — a crash
+ *  or restart (deploy, OOM, anything) mid-claim leaves nothing to run that
+ *  code, and since the queue worker only ever looks at 'queued' rows, an
+ *  un-reverted 'assigning' row would otherwise sit stuck forever. Any claim
+ *  genuinely still in flight is far shorter-lived than this threshold (the
+ *  agent's own createVm budget tops out well under a minute per host). */
+export async function reclaimStaleAssignments(staleAfterMs = 3 * 60_000): Promise<void> {
+  await query(
+    `UPDATE environment_requests SET status = 'queued', claimed_at = NULL
+     WHERE status = 'assigning' AND claimed_at < now() - ($1 || ' milliseconds')::interval`,
+    [staleAfterMs],
+  );
 }
 
 /** Entry point for POST /environments. Always durable (a queue row exists
