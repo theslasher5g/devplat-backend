@@ -67,19 +67,47 @@ export async function tryAssign(requestId: string, teamId: string, vcpu: number,
   const hosts = await candidateHosts(vcpu, ramMb);
   if (hosts.length === 0) return null;
 
+  // Claim the row before doing anything slow. createVm() boots a real VM and
+  // waits for its guest dockerd to become reachable — that can take several
+  // seconds, long enough to still be in flight on the next queue-worker tick
+  // (see queueWorker.ts, ticking every few seconds). Without a claim, that
+  // next tick's own SELECT ... WHERE status = 'queued' would see this same
+  // row untouched and start a second, fully independent tryAssign() for it —
+  // each one booting its own VM. Only the last UPDATE below would ever be
+  // remembered, silently orphaning every earlier VM as a permanently
+  // running, permanently untracked resource leak. This was masked as long
+  // as createVm() was slow enough to reliably blow past every timeout layer
+  // (it just failed instead of racing) — fixing that unmasked this bug.
+  const claimed = await maybeOne<{ id: string }>(
+    "UPDATE environment_requests SET status = 'assigning' WHERE id = $1 AND status = 'queued' RETURNING id",
+    [requestId],
+  );
+  if (!claimed) return null; // already claimed by a concurrent attempt
+
   for (const host of hosts) {
     const client = clientForHost(host);
     if (!client) continue;
     try {
       const vm = await client.createVm(teamId, DEFAULT_TTL_MINUTES, vcpu, ramMb);
-      return await withTransaction(async (tx) => {
-        await tx.query(
-          `UPDATE environment_requests
-           SET status = 'assigned', host_id = $1, vm_id = $2, docker_endpoint = $3,
-               vcpu = $4, ram_mb = $5, assigned_at = now()
-           WHERE id = $6`,
-          [host.id, vm.vmId, vm.dockerEndpoint, vcpu, ramMb, requestId],
-        );
+      const assignedRow = await maybeOne<{ id: string }>(
+        `UPDATE environment_requests
+         SET status = 'assigned', host_id = $1, vm_id = $2, docker_endpoint = $3,
+             vcpu = $4, ram_mb = $5, assigned_at = now()
+         WHERE id = $6 AND status = 'assigning'
+         RETURNING id`,
+        [host.id, vm.vmId, vm.dockerEndpoint, vcpu, ramMb, requestId],
+      );
+      if (!assignedRow) {
+        // Released (or otherwise moved on) while createVm() was in flight —
+        // nobody's going to ask for this VM, don't leak it.
+        try {
+          await client.deleteVm(vm.vmId);
+        } catch (err) {
+          console.warn(`[scheduler] cleanup deleteVm failed for orphaned ${vm.vmId}: ${(err as Error).message}`);
+        }
+        return null;
+      }
+      await withTransaction(async (tx) => {
         await tx.query(
           `INSERT INTO usage_events (team_id, host_id, vm_id, event_type, docker_endpoint, request_id)
            VALUES ($1, $2, $3, 'start', $4, $5)`,
@@ -92,8 +120,8 @@ export async function tryAssign(requestId: string, teamId: string, vcpu: number,
           'UPDATE hosts SET cpu_used = cpu_used + $1, ram_used_mb = ram_used_mb + $2 WHERE id = $3',
           [vcpu, ramMb, host.id],
         );
-        return { requestId, status: 'assigned', hostId: host.id, vmId: vm.vmId, dockerEndpoint: vm.dockerEndpoint };
       });
+      return { requestId, status: 'assigned', hostId: host.id, vmId: vm.vmId, dockerEndpoint: vm.dockerEndpoint };
     } catch (err) {
       const message = err instanceof AgentError ? err.message : (err as Error).message;
       // fetch()'s own errors (undici) nest the actual OS-level cause
@@ -111,6 +139,10 @@ export async function tryAssign(requestId: string, teamId: string, vcpu: number,
       // fall through to the next candidate host
     }
   }
+  // Every reachable host failed — release the claim so the queue worker
+  // picks this row up again on a later tick instead of it being stuck in
+  // 'assigning' forever.
+  await query("UPDATE environment_requests SET status = 'queued' WHERE id = $1 AND status = 'assigning'", [requestId]);
   return null;
 }
 
@@ -144,7 +176,7 @@ export async function releaseEnvironment(teamId: string, requestId: string): Pro
   // that happens this affects 0 rows and falls through to the normal
   // assigned-release path below.
   const releasedQueued = await maybeOne<{ id: string }>(
-    "UPDATE environment_requests SET status = 'released', released_at = now() WHERE id = $1 AND team_id = $2 AND status = 'queued' RETURNING id",
+    "UPDATE environment_requests SET status = 'released', released_at = now() WHERE id = $1 AND team_id = $2 AND status IN ('queued', 'assigning') RETURNING id",
     [requestId, teamId],
   );
   if (releasedQueued) return { ok: true };
