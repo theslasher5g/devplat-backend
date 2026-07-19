@@ -17,6 +17,7 @@
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
     "@fastify/cors": "^11.0.1",
+    "@fastify/rate-limit": "^10.3.0",
     "@fastify/websocket": "^11.3.0",
     "@react-email/components": "^0.0.36",
     "@react-email/render": "^1.0.6",

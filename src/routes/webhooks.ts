@@ -46,7 +46,11 @@ export default async function webhookRoutes(app: FastifyInstance): Promise<void>
     done(null, body);
   });
 
-  app.post('/webhooks/stripe', async (req, reply) => {
+  // Opt out of the global rate limit: this is called by Stripe (already
+  // authenticated by signature verification below), can legitimately burst
+  // during retries/backfills, and dropping a billing event to a limiter
+  // would silently desync a team's plan tier.
+  app.post('/webhooks/stripe', { config: { rateLimit: false } }, async (req, reply) => {
     const signature = req.headers['stripe-signature'];
     if (!signature || !config.stripeWebhookSecret) {
       return reply.code(400).send({ error: 'missing_signature_or_secret' });

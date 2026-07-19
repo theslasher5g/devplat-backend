@@ -18,7 +18,13 @@ function teamIdOf(req: { apiTokenTeamId?: string; membership?: { teamId: string 
  * TCP socket (server-side, over WireGuard) are both up.
  */
 export default async function tunnelRoutes(app: FastifyInstance): Promise<void> {
-  app.get('/environments/:id/tunnel', { websocket: true, preHandler: requireApiTokenOrUser }, (socket, req) => {
+  // Opt out of the global rate limit: a single Testcontainers run legitimately
+  // opens many short-lived Docker connections, each of which becomes its own
+  // WebSocket to this endpoint (one WS per local TCP connection, by design —
+  // see the CLI's tunnel bridge). The per-team parallelism cap enforced at
+  // environment-assignment time is the real abuse control here, not a
+  // per-request limiter on the byte pipe.
+  app.get('/environments/:id/tunnel', { websocket: true, preHandler: requireApiTokenOrUser, config: { rateLimit: false } }, (socket, req) => {
     // The WebSocket handshake is already complete by the time this handler
     // runs — the client can start sending immediately. Everything below
     // needs a DB lookup and a TCP dial before it's ready to relay, so the

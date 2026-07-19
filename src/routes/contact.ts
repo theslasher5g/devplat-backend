@@ -22,6 +22,10 @@ export default async function contactRoutes(app: FastifyInstance): Promise<void>
         },
       },
     },
+    // Unauthenticated + writes a DB row + sends an email on every hit — a
+    // prime spam/abuse target. Tight per-IP cap; a real visitor sends one
+    // message, not ten a minute.
+    config: { rateLimit: { max: 5, timeWindow: '1 hour' } },
   }, async (req, reply) => {
     const { name, email, company, message } = req.body as {
       name: string; email: string; company?: string; message: string;

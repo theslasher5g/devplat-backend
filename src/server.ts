@@ -1,5 +1,6 @@
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { config } from './config.js';
@@ -40,6 +41,26 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
   await app.register(cookie);
   await app.register(websocket);
+
+  // Global per-IP rate limit as a blanket DoS backstop. `trustProxy` above
+  // means req.ip is the real client (X-Forwarded-For from Traefik), not
+  // Traefik's own address, so this keys on the actual caller. The default
+  // here is deliberately generous — legitimate single-IP use (the dashboard,
+  // plus the CLI polling GET /environments/:id every ~2s) stays well under
+  // it; individual sensitive endpoints tighten this a lot via each route's
+  // own `config.rateLimit` (see auth.ts / contact.ts). Two endpoints opt OUT
+  // entirely (config.rateLimit: false): the tunnel, because a single
+  // Testcontainers run legitimately opens many short-lived WebSocket
+  // connections to it, and the Stripe webhook, which must never drop a
+  // billing event to a limiter.
+  await app.register(rateLimit, {
+    global: true,
+    max: 600,
+    timeWindow: '1 minute',
+    // Reads behind the proxy correctly; skip the plugin's own warning since
+    // trustProxy is intentional here.
+    keyGenerator: (req) => req.ip,
+  });
 
   app.setErrorHandler((rawErr, req, reply) => {
     const err = rawErr as Error & { code?: string; statusCode?: number; validation?: unknown };

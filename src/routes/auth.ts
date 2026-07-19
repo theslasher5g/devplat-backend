@@ -28,7 +28,13 @@ async function createOneTimeToken(userId: string, type: 'verify_email' | 'passwo
 }
 
 export default async function authRoutes(app: FastifyInstance): Promise<void> {
-  app.post('/auth/register', { schema: { body: credentialsSchema }, config: { rateLimit: true } }, async (req, reply) => {
+  app.post('/auth/register', {
+    schema: { body: credentialsSchema },
+    // Account creation triggers a DB write + an outbound verification email;
+    // cap it hard per IP so it can't be used to spam signups / bomb an
+    // address's inbox via the verification mail.
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
+  }, async (req, reply) => {
     const { email, password, teamName } = req.body as { email: string; password: string; teamName?: string };
     const normalized = email.trim().toLowerCase();
 
@@ -80,7 +86,13 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     },
   } as const;
 
-  app.post('/auth/login', { schema: { body: loginSchema } }, async (req, reply) => {
+  app.post('/auth/login', {
+    schema: { body: loginSchema },
+    // The brute-force surface: cap password attempts per IP. 10/min still
+    // covers a human fat-fingering their password, but takes online
+    // guessing off the table.
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
     const { email, password } = req.body as { email: string; password: string };
     const user = await maybeOne<{ id: string; password_hash: string; email_verified_at: string | null }>(
       'SELECT id, password_hash, email_verified_at FROM users WHERE email = $1',
@@ -130,6 +142,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/auth/verify-email', {
     schema: { body: { type: 'object', required: ['token'], properties: { token: { type: 'string', maxLength: 200 } } } },
+    // Token is high-entropy so guessing is already infeasible; this just
+    // keeps the endpoint from being a free DB-query amplifier.
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
   }, async (req, reply) => {
     const { token } = req.body as { token: string };
     const row = await maybeOne<{ id: string; user_id: string }>(
@@ -168,6 +183,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/auth/resend-verification', {
     schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string', format: 'email' } } } },
+    // Sends an email to an attacker-supplied address — the classic mail-bomb
+    // vector. Cap it tightly per IP.
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
   }, async (req) => {
     const { email } = req.body as { email: string };
     const user = await maybeOne<{ id: string; email: string; email_verified_at: string | null }>(
@@ -186,6 +204,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/auth/forgot-password', {
     schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string', format: 'email' } } } },
+    // Same mail-bomb vector as resend-verification: sends to an
+    // attacker-supplied address.
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
   }, async (req) => {
     const { email } = req.body as { email: string };
     const user = await maybeOne<{ id: string; email: string }>(
@@ -212,6 +233,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
         },
       },
     },
+    config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
   }, async (req, reply) => {
     const { token, password } = req.body as { token: string; password: string };
     const row = await maybeOne<{ id: string; user_id: string }>(
