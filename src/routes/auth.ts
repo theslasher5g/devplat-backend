@@ -3,6 +3,7 @@ import { maybeOne, query, withTransaction } from '../db.js';
 import { sendPasswordResetEmail, sendVerificationEmail } from '../lib/email.js';
 import { hashPassword, verifyPassword } from '../lib/passwords.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
+import { getPlan } from '../plans.js';
 import { SESSION_COOKIE, requireUser, sessionCookieOptions, signSession } from '../plugins/auth.js';
 
 const credentialsSchema = {
@@ -55,10 +56,21 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       );
       const userId = u.rows[0].id;
       if (!pendingInvite) {
-        const team = await tx.query<{ id: string }>(
-          'INSERT INTO teams (name) VALUES ($1) RETURNING id',
-          [teamName?.trim() || normalized.split('@')[0]],
-        );
+        // Trial length comes from the free plan's trial_duration_days (the
+        // plans table is the single source of truth), not the teams column's
+        // own DEFAULT — otherwise editing the plan row would silently have no
+        // effect on new signups. Falls back to the column default (14d) only
+        // if the plan somehow has no trial window configured.
+        const trialDays = getPlan('free').trialDurationDays;
+        const team = trialDays != null
+          ? await tx.query<{ id: string }>(
+              "INSERT INTO teams (name, trial_ends_at) VALUES ($1, now() + ($2 || ' days')::interval) RETURNING id",
+              [teamName?.trim() || normalized.split('@')[0], String(trialDays)],
+            )
+          : await tx.query<{ id: string }>(
+              'INSERT INTO teams (name) VALUES ($1) RETURNING id',
+              [teamName?.trim() || normalized.split('@')[0]],
+            );
         await tx.query(
           "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')",
           [team.rows[0].id, userId],
