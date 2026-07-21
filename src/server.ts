@@ -11,6 +11,7 @@ import billingRoutes from './routes/billing.js';
 import contactRoutes from './routes/contact.js';
 import environmentRoutes from './routes/environments.js';
 import hostRoutes from './routes/hosts.js';
+import statusRoutes from './routes/status.js';
 import teamRoutes from './routes/teams.js';
 import tokenRoutes from './routes/tokens.js';
 import tunnelRoutes from './routes/tunnel.js';
@@ -89,6 +90,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(webhookRoutes);
   await app.register(adminRoutes);
   await app.register(hostRoutes);
+  await app.register(statusRoutes);
   await app.register(environmentRoutes);
   await app.register(tunnelRoutes);
 
