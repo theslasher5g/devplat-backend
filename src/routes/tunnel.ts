@@ -115,6 +115,16 @@ export default async function tunnelRoutes(app: FastifyInstance): Promise<void> 
     socket.on('close', cleanup);
     socket.on('error', cleanup);
 
+    // If the client already closed between the handshake and here (a fast
+    // client that bails, or a close queued during the async preHandler), the
+    // 'close' event may have fired before the listener above was attached —
+    // in which case cleanup() would never run and this env's tunnel count
+    // would leak upward toward MAX_TUNNELS_PER_ENV. Reconcile explicitly.
+    if (socket.readyState === socket.CLOSING || socket.readyState === socket.CLOSED) {
+      cleanup();
+      return;
+    }
+
     void (async () => {
       let upstream: net.Socket | { close: { code: number; reason: string } };
       try {
@@ -211,8 +221,6 @@ function dialTcp(host: string, port: number, label: string, req: FastifyRequest)
     const tcp = net.connect({ host, port, timeout: 10_000 });
     tcp.on('connect', () => {
       tcp.setTimeout(0); // connected — no more use for the connect-phase timeout
-      tcp.removeAllListeners('error');
-      tcp.removeAllListeners('timeout');
       resolve(tcp);
     });
     tcp.on('timeout', () => {
@@ -220,6 +228,12 @@ function dialTcp(host: string, port: number, label: string, req: FastifyRequest)
       tcp.destroy();
       reject(new Error(`connection to ${label} timed out`));
     });
+    // Keep this 'error' listener attached even after resolve. The caller
+    // re-attaches its own on a later microtask (after `await`); removing this
+    // one on connect would leave a window with NO 'error' listener, and a
+    // socket 'error' with no listener is thrown as an uncaught exception that
+    // crashes the process. After resolve, reject() is a settled no-op, so the
+    // only effect of leaving it is that the socket always has a handler.
     tcp.on('error', (err) => reject(err));
   });
 }
@@ -251,6 +265,12 @@ function dialAgentProxy(agentEndpoint: string, agentToken: string, vmId: string,
     });
     request.on('upgrade', (_res, socket, head) => {
       socket.setTimeout(0);
+      // The caller attaches its 'error'/'data'/'close' handlers on a later
+      // microtask (after `await`). Attach a persistent 'error' listener now
+      // so the upgraded socket is never without one — a socket 'error' with
+      // no listener is thrown as an uncaught exception that crashes the
+      // process. This handler is additive; the caller's cleanup still runs.
+      socket.on('error', () => {});
       // Bytes the guest sent immediately after the 101 can already sit in
       // `head`; unshift puts them back at the front of the stream so the
       // relay's 'data' listener (attached after this resolves) sees them.
