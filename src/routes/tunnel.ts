@@ -33,7 +33,26 @@ function teamIdOf(req: { apiTokenTeamId?: string; membership?: { teamId: string 
  *   derives the guest IP strictly from the VM id, so the same team check
  *   that guards docker_endpoint guards every container port too.
  */
+// Safety valves against an authenticated client opening many tunnels to
+// amplify resource use (these routes are deliberately exempt from the global
+// rate limit — see below). Neither trips in legitimate use: a Testcontainers
+// run opens many short-lived connections, but rarely hundreds at once against
+// one environment, and only ever buffers a request's worth of bytes during
+// the sub-second upstream dial. They cap the worst case rather than shape the
+// common one.
+const MAX_TUNNELS_PER_ENV = 512;
+// Bytes a client may buffer BEFORE the upstream socket is ready. This window
+// is just the dial latency (well under a second over WireGuard), so real
+// pre-connect data is a few KB; anything approaching this is a client
+// streaming into a pipe that isn't draining yet.
+const MAX_PENDING_BYTES = 4 * 1024 * 1024;
+
 export default async function tunnelRoutes(app: FastifyInstance): Promise<void> {
+  // Active tunnel count per environment id, for MAX_TUNNELS_PER_ENV. Entries
+  // are deleted when they hit zero so this can't grow unbounded across the
+  // lifetime of the process.
+  const activeTunnels = new Map<string, number>();
+
   // relay wires one client WebSocket to one upstream TCP socket produced by
   // `connect`. The WebSocket handshake is already complete by the time a
   // handler runs — the client can start sending immediately. Everything the
@@ -45,9 +64,27 @@ export default async function tunnelRoutes(app: FastifyInstance): Promise<void> 
   const relay = (
     socket: WebSocket,
     req: FastifyRequest,
+    envId: string,
     connect: () => Promise<net.Socket | { close: { code: number; reason: string } }>,
   ): void => {
+    const openNow = activeTunnels.get(envId) ?? 0;
+    if (openNow >= MAX_TUNNELS_PER_ENV) {
+      req.log.warn({ envId, openNow }, 'tunnel: per-environment tunnel cap reached');
+      if (socket.readyState === socket.OPEN) socket.close(4429, 'too_many_tunnels');
+      return;
+    }
+    activeTunnels.set(envId, openNow + 1);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      const next = (activeTunnels.get(envId) ?? 1) - 1;
+      if (next <= 0) activeTunnels.delete(envId);
+      else activeTunnels.set(envId, next);
+    };
+
     const pending: Buffer[] = [];
+    let pendingBytes = 0;
     let tcp: net.Socket | null = null;
     let tcpReady = false;
     let closed = false;
@@ -55,14 +92,25 @@ export default async function tunnelRoutes(app: FastifyInstance): Promise<void> 
     const cleanup = () => {
       if (closed) return;
       closed = true;
+      release();
       tcp?.destroy();
       if (socket.readyState === socket.OPEN) socket.close();
     };
 
     socket.on('message', (data: RawData) => {
       const buf = data as Buffer;
-      if (tcpReady && tcp) tcp.write(buf);
-      else pending.push(buf);
+      if (tcpReady && tcp) {
+        tcp.write(buf);
+        return;
+      }
+      pendingBytes += buf.length;
+      if (pendingBytes > MAX_PENDING_BYTES) {
+        req.log.warn({ envId, pendingBytes }, 'tunnel: pre-connect buffer cap exceeded');
+        if (socket.readyState === socket.OPEN) socket.close(4013, 'buffer_overflow');
+        cleanup();
+        return;
+      }
+      pending.push(buf);
     });
     socket.on('close', cleanup);
     socket.on('error', cleanup);
@@ -110,8 +158,8 @@ export default async function tunnelRoutes(app: FastifyInstance): Promise<void> 
   // environment-assignment time is the real abuse control here, not a
   // per-request limiter on the byte pipe.
   app.get('/environments/:id/tunnel', { websocket: true, preHandler: requireApiTokenOrUser, config: { rateLimit: false } }, (socket, req) => {
-    relay(socket, req, async () => {
-      const { id } = req.params as { id: string };
+    const { id } = req.params as { id: string };
+    relay(socket, req, id, async () => {
       const teamId = teamIdOf(req);
       const row = await maybeOne<{ docker_endpoint: string | null; status: string }>(
         `SELECT docker_endpoint, status FROM environment_requests WHERE id = $1 AND team_id = $2`,
@@ -127,8 +175,8 @@ export default async function tunnelRoutes(app: FastifyInstance): Promise<void> 
   });
 
   app.get('/environments/:id/tunnel/:port', { websocket: true, preHandler: requireApiTokenOrUser, config: { rateLimit: false } }, (socket, req) => {
-    relay(socket, req, async () => {
-      const { id, port: portStr } = req.params as { id: string; port: string };
+    const { id, port: portStr } = req.params as { id: string; port: string };
+    relay(socket, req, id, async () => {
       const port = Number(portStr);
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         return { close: { code: 4400, reason: 'invalid_port' } };
