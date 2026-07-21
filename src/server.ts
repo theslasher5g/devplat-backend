@@ -6,6 +6,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { config } from './config.js';
 import adminRoutes from './routes/admin.js';
 import authRoutes from './routes/auth.js';
+import deviceAuthRoutes from './routes/deviceAuth.js';
 import billingRoutes from './routes/billing.js';
 import contactRoutes from './routes/contact.js';
 import environmentRoutes from './routes/environments.js';
@@ -80,6 +81,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get('/health', async () => ({ ok: true, service: 'devplat-api' }));
 
   await app.register(authRoutes);
+  await app.register(deviceAuthRoutes);
   await app.register(contactRoutes);
   await app.register(teamRoutes);
   await app.register(tokenRoutes);
