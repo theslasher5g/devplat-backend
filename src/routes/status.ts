@@ -17,7 +17,14 @@ const COMPONENT_STATUSES = ['operational', 'degraded', 'partial_outage', 'major_
 
 export default async function statusRoutes(app: FastifyInstance): Promise<void> {
   // ---- Public: the status page + the dashboard panel both read this ----
-  app.get('/status', async () => getStatusSummary());
+  // ?historyDays=N includes the per-component daily uptime bars; ?before=ISO
+  // ends the window earlier (date-range paging on the status page).
+  app.get('/status', async (req) => {
+    const q = req.query as { historyDays?: string; before?: string };
+    const historyDays = q.historyDays ? Math.max(0, Math.min(365, parseInt(q.historyDays, 10) || 0)) : 0;
+    const before = q.before ? new Date(q.before) : undefined;
+    return getStatusSummary({ historyDays, before: before && !isNaN(before.getTime()) ? before : undefined });
+  });
 
   // ---- Admin: components ----
   app.get('/admin/status/components', { preHandler: requirePlatformAdmin }, async () => {
