@@ -1,7 +1,22 @@
+import { randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { maybeOne, query, withTransaction } from '../db.js';
+import { sendStatusConfirmEmail, sendStatusNotifyEmail } from '../lib/email.js';
 import { attachUpdates, getStatusSummary, type PostRow } from '../lib/status.js';
+import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { requirePlatformAdmin } from '../plugins/auth.js';
+
+const TYPE_LABEL: Record<string, string> = { incident: 'Incident', maintenance: 'Maintenance', announcement: 'Announcement' };
+
+/** Fire-and-forget: email every confirmed subscriber about a status event.
+ *  Best-effort — a Resend outage must not fail the admin's action. */
+async function notifySubscribers(kicker: string, title: string, body: string): Promise<void> {
+  const subs = await query<{ email: string; unsubscribe_token: string }>(
+    'SELECT email, unsubscribe_token FROM status_subscribers WHERE confirmed_at IS NOT NULL',
+  );
+  await Promise.allSettled(subs.rows.map((s) =>
+    sendStatusNotifyEmail(s.email, { kicker, title, body, unsubscribeToken: s.unsubscribe_token })));
+}
 
 // Allowed lifecycle states per post type, and which of them mean "this post is
 // over" (sets resolved_at, moving it from active to history).
@@ -119,6 +134,9 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
       [b.type, b.title, b.body ?? '', b.impact ?? DEFAULT_IMPACT[b.type], state,
         b.affectedComponents ?? [], b.scheduledStart ?? null, b.scheduledEnd ?? null, req.user.id, resolvedAt],
     );
+    // Notify subscribers of the new post (fire-and-forget).
+    void notifySubscribers(`${TYPE_LABEL[b.type]} · ${state.replace(/_/g, ' ')}`, b.title, b.body ?? '')
+      .catch((err) => req.log.warn({ err }, 'status: subscriber notify failed'));
     return reply.code(201).send({ id: row.rows[0].id });
   });
 
@@ -164,7 +182,7 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
   }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const b = req.body as { body: string; state?: string };
-    const post = await maybeOne<{ type: string }>('SELECT type FROM status_posts WHERE id = $1', [id]);
+    const post = await maybeOne<{ type: string; title: string }>('SELECT type, title FROM status_posts WHERE id = $1', [id]);
     if (!post) return reply.code(404).send({ error: 'not_found' });
     if (b.state !== undefined && !STATES[post.type].includes(b.state)) return reply.code(400).send({ error: 'invalid_state_for_type' });
 
@@ -182,6 +200,9 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
         await tx.query('UPDATE status_posts SET updated_at = now() WHERE id = $1', [id]);
       }
     });
+    const kicker = b.state ? `${TYPE_LABEL[post.type]} · ${b.state.replace(/_/g, ' ')}` : `Update · ${TYPE_LABEL[post.type]}`;
+    void notifySubscribers(kicker, post.title, b.body)
+      .catch((err) => req.log.warn({ err }, 'status: subscriber notify failed'));
     return reply.code(201).send({ ok: true });
   });
 
@@ -189,6 +210,55 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
     const { id } = req.params as { id: string };
     const found = await maybeOne('DELETE FROM status_posts WHERE id = $1 RETURNING id', [id]);
     if (!found) return reply.code(404).send({ error: 'not_found' });
+    return { ok: true };
+  });
+
+  // ---- Public: email subscriptions (double opt-in) ----
+  app.post('/status/subscribe', {
+    // A DB write + outbound email per call; cap per IP so it can't be used to
+    // mail-bomb an address via the confirmation mail.
+    config: { rateLimit: { max: 5, timeWindow: '10 minutes' } },
+    schema: { body: { type: 'object', required: ['email'], properties: { email: { type: 'string', format: 'email', maxLength: 255 } } } },
+  }, async (req, reply) => {
+    const email = (req.body as { email: string }).email.trim().toLowerCase();
+    const existing = await maybeOne<{ confirmed_at: string | null }>('SELECT confirmed_at FROM status_subscribers WHERE email = $1', [email]);
+    // Already confirmed → say ok without re-sending (and without revealing it).
+    if (existing?.confirmed_at) return reply.send({ ok: true });
+
+    const { token, hash } = generateOneTimeToken();
+    if (existing) {
+      await query('UPDATE status_subscribers SET confirm_token_hash = $1 WHERE email = $2', [hash, email]);
+    } else {
+      await query(
+        'INSERT INTO status_subscribers (email, confirm_token_hash, unsubscribe_token) VALUES ($1, $2, $3)',
+        [email, hash, randomBytes(24).toString('base64url')],
+      );
+    }
+    await sendStatusConfirmEmail(email, token).catch((err) => req.log.warn({ err }, 'status: confirm email failed'));
+    return reply.send({ ok: true });
+  });
+
+  app.post('/status/confirm', {
+    schema: { body: { type: 'object', required: ['token'], properties: { token: { type: 'string', minLength: 1, maxLength: 200 } } } },
+  }, async (req, reply) => {
+    const { token } = req.body as { token: string };
+    // Idempotent: keep the token so a refresh / double-fire (or React's
+    // dev-mode double effect) confirms again cleanly instead of 404-ing.
+    const row = await maybeOne<{ id: string }>(
+      `UPDATE status_subscribers SET confirmed_at = COALESCE(confirmed_at, now())
+       WHERE confirm_token_hash = $1 RETURNING id`,
+      [hashToken(token)],
+    );
+    if (!row) return reply.code(404).send({ error: 'invalid_or_used_token' });
+    return { ok: true };
+  });
+
+  app.post('/status/unsubscribe', {
+    schema: { body: { type: 'object', required: ['token'], properties: { token: { type: 'string', minLength: 1, maxLength: 200 } } } },
+  }, async (req) => {
+    // Idempotent: unknown/again-used token still returns ok so the link never
+    // errors and we don't reveal whether an address was subscribed.
+    await query('DELETE FROM status_subscribers WHERE unsubscribe_token = $1', [(req.body as { token: string }).token]);
     return { ok: true };
   });
 }

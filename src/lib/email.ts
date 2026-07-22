@@ -4,6 +4,8 @@ import type { ReactElement } from 'react';
 import { config } from '../config.js';
 import ContactSubmission from '../emails/ContactSubmission.js';
 import ResetPassword from '../emails/ResetPassword.js';
+import StatusConfirm from '../emails/StatusConfirm.js';
+import StatusNotify from '../emails/StatusNotify.js';
 import TeamInvite from '../emails/TeamInvite.js';
 import VerifyEmail from '../emails/VerifyEmail.js';
 
@@ -35,6 +37,23 @@ export async function sendTeamInviteEmail(
 ): Promise<void> {
   const inviteUrl = `${config.frontendUrl}/invite?token=${token}`;
   await send(to, `Invitation: join ${teamName} on devplat`, TeamInvite({ inviteUrl, teamName, inviterEmail, role }), inviteUrl);
+}
+
+export async function sendStatusConfirmEmail(to: string, token: string): Promise<void> {
+  const confirmUrl = `${config.frontendUrl}/status/confirm?token=${token}`;
+  await send(to, 'Confirm your devplat status subscription', StatusConfirm({ confirmUrl }), confirmUrl);
+}
+
+/** Notifies one confirmed subscriber of a status event. `unsubscribeToken` is
+ *  the subscriber's own capability token for the one-click unsubscribe link. */
+export async function sendStatusNotifyEmail(
+  to: string,
+  payload: { kicker: string; title: string; body: string; unsubscribeToken: string },
+): Promise<void> {
+  const statusUrl = `${config.frontendUrl}/status`;
+  const unsubscribeUrl = `${config.frontendUrl}/status/unsubscribe?token=${payload.unsubscribeToken}`;
+  await send(to, `[devplat status] ${payload.title}`,
+    StatusNotify({ kicker: payload.kicker, title: payload.title, body: payload.body, statusUrl, unsubscribeUrl }));
 }
 
 /** Notifies the contact inbox of a new "Book a call" / contact-form submission.
