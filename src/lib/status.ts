@@ -26,6 +26,7 @@ function worst(levels: StatusLevel[]): StatusLevel {
 
 interface ComponentRow {
   key: string; name: string; source: 'api' | 'compute' | 'manual'; manual_status: StatusLevel | null; position: number;
+  group_name: string | null;
 }
 
 /** Aggregate the compute component from live host rows: all online → up, some
@@ -85,7 +86,11 @@ export async function attachUpdates(posts: PostRow[]): Promise<StatusPost[]> {
 // --- Per-component daily uptime history (the OpenAI-style bars) ---
 
 export interface DayStatus { date: string; status: StatusLevel }
-export interface ComponentSummary { key: string; name: string; status: StatusLevel; uptime: number; history: DayStatus[] }
+export interface ComponentSummary {
+  key: string; name: string; status: StatusLevel; uptime: number; history: DayStatus[];
+  // Present on group nodes: the member components, each a full summary.
+  children?: ComponentSummary[];
+}
 
 /** Map a post to the component-level status it implies on a day it's active. */
 function postLevel(type: string, impact: string): StatusLevel {
@@ -111,7 +116,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * (e.g. a host down right now with no incident posted yet).
  */
 async function componentHistories(
-  components: { key: string; status: StatusLevel }[],
+  // Each entry matches posts affecting ANY of its keys (a single component has
+  // one key; a group has all its members' keys, so it's impaired whenever any
+  // member is). `status` is the entry's current live status, folded into today.
+  entries: { id: string; keys: string[]; status: StatusLevel }[],
   windowStart: Date,
   windowEnd: Date,
 ): Promise<Map<string, { uptime: number; history: DayStatus[] }>> {
@@ -130,8 +138,9 @@ async function componentHistories(
   const nowMs = Date.now();
   const out = new Map<string, { uptime: number; history: DayStatus[] }>();
 
-  for (const c of components) {
-    const posts = rows.rows.filter((p) => p.affected_components.includes(c.key));
+  for (const entry of entries) {
+    const keySet = new Set(entry.keys);
+    const posts = rows.rows.filter((p) => p.affected_components.some((k) => keySet.has(k)));
     const history: DayStatus[] = [];
     let downtimeMs = 0;
 
@@ -151,16 +160,16 @@ async function componentHistories(
           }
         }
       }
-      // Today's bar also reflects the live component status.
+      // Today's bar also reflects the live status.
       const isToday = dayEnd > nowMs && dayStart <= nowMs;
-      if (isToday && RANK[c.status] > RANK[level]) level = c.status;
+      if (isToday && RANK[entry.status] > RANK[level]) level = entry.status;
       history.push({ date: new Date(dayStart).toISOString().slice(0, 10), status: level });
     }
 
     // Only count elapsed time (don't penalize the future part of today's window).
     const elapsedMs = Math.min(windowEnd.getTime(), nowMs) - windowStart.getTime();
     const uptime = elapsedMs > 0 ? Math.max(0, 1 - downtimeMs / elapsedMs) * 100 : 100;
-    out.set(c.key, { uptime, history });
+    out.set(entry.id, { uptime, history });
   }
   return out;
 }
@@ -176,15 +185,56 @@ export async function getStatusSummary(opts: { historyDays?: number; before?: Da
   recent: StatusPost[];
   window?: { start: string; end: string };
 }> {
-  const [componentRows, computeStatus] = await Promise.all([
-    query<ComponentRow>('SELECT key, name, source, manual_status, position FROM status_components ORDER BY position, name'),
+  const [componentRows, computeStatus, activeRowsEarly] = await Promise.all([
+    query<ComponentRow>('SELECT key, name, source, manual_status, position, group_name FROM status_components ORDER BY position, name'),
     deriveComputeStatus(),
+    query<PostRow>(
+      `SELECT * FROM status_posts
+       WHERE resolved_at IS NULL AND NOT (type = 'maintenance' AND state = 'scheduled')
+       ORDER BY created_at DESC`,
+    ),
   ]);
-  const baseComponents = await Promise.all(
+
+  // Worst active-incident/maintenance impact per component, so a component's
+  // current icon reflects an ongoing incident affecting it (not just its bar).
+  const activeImpact = new Map<string, StatusLevel>();
+  for (const p of activeRowsEarly.rows) {
+    if (p.type === 'announcement') continue;
+    const lvl = postLevel(p.type, p.impact);
+    for (const key of p.affected_components) {
+      if (RANK[lvl] > RANK[activeImpact.get(key) ?? 'operational']) activeImpact.set(key, lvl);
+    }
+  }
+
+  // Flat list of leaf components with their live status — the worse of the
+  // derived/manual status and any active incident affecting them — preserving
+  // DB order and group membership.
+  const leaves = await Promise.all(
     componentRows.rows.map(async (c) => ({
-      key: c.key, name: c.name, status: await effectiveComponentStatus(c, computeStatus),
+      key: c.key, name: c.name, group: c.group_name,
+      status: worst([await effectiveComponentStatus(c, computeStatus), activeImpact.get(c.key) ?? 'operational']),
     })),
   );
+
+  // Assemble the display order: the first time a group is seen, emit the whole
+  // group (with its members as children); ungrouped components emit inline.
+  type Node = { key: string; name: string; status: StatusLevel; children?: typeof leaves };
+  const displayNodes: Node[] = [];
+  const seenGroups = new Set<string>();
+  for (const l of leaves) {
+    if (!l.group) {
+      displayNodes.push({ key: l.key, name: l.name, status: l.status });
+      continue;
+    }
+    if (seenGroups.has(l.group)) continue;
+    seenGroups.add(l.group);
+    const members = leaves.filter((m) => m.group === l.group);
+    displayNodes.push({
+      key: `group:${l.group}`, name: l.group,
+      status: worst(members.map((m) => m.status)),
+      children: members,
+    });
+  }
 
   // Optional history window (default: none, for the lightweight dashboard/footer reads).
   const historyDays = opts.historyDays && opts.historyDays > 0 ? Math.min(opts.historyDays, 365) : 0;
@@ -195,24 +245,33 @@ export async function getStatusSummary(opts: { historyDays?: number; before?: Da
     // Snap the window to whole UTC days ending at the end of the end-day.
     const windowEnd = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()) + DAY_MS);
     const windowStart = new Date(windowEnd.getTime() - historyDays * DAY_MS);
-    histories = await componentHistories(baseComponents, windowStart, windowEnd);
+    // One history entry per leaf (its own key) and per group (union of member
+    // keys, so the group's bar is red whenever any member is).
+    const entries = [
+      ...leaves.map((l) => ({ id: `leaf:${l.key}`, keys: [l.key], status: l.status })),
+      ...displayNodes.filter((n) => n.children).map((n) => ({
+        id: n.key, keys: n.children!.map((m) => m.key), status: n.status,
+      })),
+    ];
+    histories = await componentHistories(entries, windowStart, windowEnd);
     window = { start: windowStart.toISOString(), end: windowEnd.toISOString() };
   }
-  const components: ComponentSummary[] = baseComponents.map((c) => ({
-    ...c,
-    uptime: histories.get(c.key)?.uptime ?? 100,
-    history: histories.get(c.key)?.history ?? [],
-  }));
+  const withHistory = (id: string, base: { key: string; name: string; status: StatusLevel }): ComponentSummary => ({
+    ...base,
+    uptime: histories.get(id)?.uptime ?? 100,
+    history: histories.get(id)?.history ?? [],
+  });
+  const components: ComponentSummary[] = displayNodes.map((n) =>
+    n.children
+      ? { ...withHistory(n.key, n), children: n.children.map((m) => withHistory(`leaf:${m.key}`, m)) }
+      : withHistory(`leaf:${n.key}`, n),
+  );
+  // Overall is computed from the leaf statuses (below), unaffected by grouping.
+  const baseComponents = leaves;
 
-  // Active = unresolved incidents + in-progress maintenance + published
-  // announcements. Upcoming = scheduled maintenance still in the future.
-  // Recent = the last handful of resolved/completed posts for the history.
-  const [activeRows, upcomingRows, recentRows] = await Promise.all([
-    query<PostRow>(
-      `SELECT * FROM status_posts
-       WHERE resolved_at IS NULL AND NOT (type = 'maintenance' AND state = 'scheduled')
-       ORDER BY created_at DESC`,
-    ),
+  // Active reuses the rows fetched up top. Upcoming = scheduled maintenance
+  // still in the future. Recent = the last handful of resolved posts.
+  const [upcomingRows, recentRows] = await Promise.all([
     query<PostRow>(
       `SELECT * FROM status_posts
        WHERE type = 'maintenance' AND state = 'scheduled' AND resolved_at IS NULL
@@ -224,19 +283,12 @@ export async function getStatusSummary(opts: { historyDays?: number; before?: Da
   ]);
 
   const [active, upcoming, recent] = await Promise.all([
-    attachUpdates(activeRows.rows), attachUpdates(upcomingRows.rows), attachUpdates(recentRows.rows),
+    attachUpdates(activeRowsEarly.rows), attachUpdates(upcomingRows.rows), attachUpdates(recentRows.rows),
   ]);
 
   // Overall = worst of component statuses plus what active posts imply.
-  const postLevels: StatusLevel[] = active.map((p) => {
-    if (p.type === 'maintenance') return 'maintenance';
-    if (p.type === 'announcement') return 'operational';
-    if (p.impact === 'critical') return 'major_outage';
-    if (p.impact === 'major') return 'partial_outage';
-    if (p.impact === 'minor') return 'degraded';
-    return 'operational';
-  });
-  const status = worst([...components.map((c) => c.status), ...postLevels]);
+  const postLevels: StatusLevel[] = active.map((p) => postLevel(p.type, p.impact));
+  const status = worst([...baseComponents.map((c) => c.status), ...postLevels]);
 
   return { overall: { status, label: LABEL[status] }, components, active, upcoming, recent, window };
 }

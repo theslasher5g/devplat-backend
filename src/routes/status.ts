@@ -28,17 +28,17 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
 
   // ---- Admin: components ----
   app.get('/admin/status/components', { preHandler: requirePlatformAdmin }, async () => {
-    const rows = await query<{ id: string; key: string; name: string; source: string; manual_status: string | null; position: number }>(
-      'SELECT id, key, name, source, manual_status, position FROM status_components ORDER BY position, name',
+    const rows = await query<{ id: string; key: string; name: string; source: string; manual_status: string | null; position: number; group_name: string | null }>(
+      'SELECT id, key, name, source, manual_status, position, group_name FROM status_components ORDER BY position, name',
     );
-    return { components: rows.rows.map((c) => ({ id: c.id, key: c.key, name: c.name, source: c.source, manualStatus: c.manual_status, position: c.position })) };
+    return { components: rows.rows.map((c) => ({ id: c.id, key: c.key, name: c.name, source: c.source, manualStatus: c.manual_status, position: c.position, groupName: c.group_name })) };
   });
 
   // Set/clear a manual status (override for derived components, the value for
-  // manual ones), rename, or reorder.
+  // manual ones), rename, reorder, or assign to a group.
   app.patch('/admin/status/components/:id', { preHandler: requirePlatformAdmin }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const body = req.body as { manualStatus?: string | null; name?: string; position?: number };
+    const body = req.body as { manualStatus?: string | null; name?: string; position?: number; groupName?: string | null };
     if (body.manualStatus !== undefined && body.manualStatus !== null && !COMPONENT_STATUSES.includes(body.manualStatus)) {
       return reply.code(400).send({ error: 'invalid_status' });
     }
@@ -47,6 +47,7 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
     if (body.manualStatus !== undefined) { fields.push(`manual_status = $${fields.length + 1}`); values.push(body.manualStatus); }
     if (body.name !== undefined) { fields.push(`name = $${fields.length + 1}`); values.push(body.name); }
     if (body.position !== undefined) { fields.push(`position = $${fields.length + 1}`); values.push(body.position); }
+    if (body.groupName !== undefined) { fields.push(`group_name = $${fields.length + 1}`); values.push(body.groupName || null); }
     if (fields.length === 0) return reply.code(400).send({ error: 'no_fields' });
     values.push(id);
     const found = await maybeOne(`UPDATE status_components SET ${fields.join(', ')}, updated_at = now() WHERE id = $${fields.length + 1} RETURNING id`, values);
@@ -54,7 +55,8 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
     return { ok: true };
   });
 
-  // Add a manual component (e.g. "Registry cache") the admin sets by hand.
+  // Add a manual component (e.g. "Registry cache") the admin sets by hand,
+  // optionally under a group.
   app.post('/admin/status/components', {
     preHandler: requirePlatformAdmin,
     schema: { body: { type: 'object', required: ['key', 'name'], properties: {
@@ -62,15 +64,16 @@ export default async function statusRoutes(app: FastifyInstance): Promise<void> 
       name: { type: 'string', minLength: 1, maxLength: 100 },
       manualStatus: { type: 'string', enum: COMPONENT_STATUSES },
       position: { type: 'integer' },
+      groupName: { type: 'string', maxLength: 100 },
     } } },
   }, async (req, reply) => {
-    const b = req.body as { key: string; name: string; manualStatus?: string; position?: number };
+    const b = req.body as { key: string; name: string; manualStatus?: string; position?: number; groupName?: string };
     const exists = await maybeOne('SELECT 1 FROM status_components WHERE key = $1', [b.key]);
     if (exists) return reply.code(409).send({ error: 'key_taken' });
     const row = await query<{ id: string }>(
-      `INSERT INTO status_components (key, name, source, manual_status, position)
-       VALUES ($1, $2, 'manual', $3, $4) RETURNING id`,
-      [b.key, b.name, b.manualStatus ?? 'operational', b.position ?? 100],
+      `INSERT INTO status_components (key, name, source, manual_status, position, group_name)
+       VALUES ($1, $2, 'manual', $3, $4, $5) RETURNING id`,
+      [b.key, b.name, b.manualStatus ?? 'operational', b.position ?? 100, b.groupName || null],
     );
     return reply.code(201).send({ id: row.rows[0].id });
   });
