@@ -94,7 +94,13 @@ export default async function tunnelRoutes(app: FastifyInstance): Promise<void> 
       closed = true;
       release();
       tcp?.destroy();
-      if (socket.readyState === socket.OPEN) socket.close();
+      // Explicit code: a bare socket.close() sends a zero-length close frame,
+      // which RFC 6455 requires peers to report as 1005 "no status received" —
+      // the CLI's bridge (and any other WS client) then can't tell this
+      // completely normal teardown from an actual failure. 1000 makes every
+      // ordinary connection end (client done, container stopped, etc.) show up
+      // as a normal closure instead of a scary-looking error.
+      if (socket.readyState === socket.OPEN) socket.close(1000, 'closed');
     };
 
     socket.on('message', (data: RawData) => {
