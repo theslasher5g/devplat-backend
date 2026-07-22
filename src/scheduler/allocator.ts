@@ -17,7 +17,7 @@ export interface EnvironmentResult {
   error?: string;
 }
 
-const DEFAULT_TTL_MINUTES = 60;
+export const DEFAULT_TTL_MINUTES = 60;
 
 /** Requests currently occupying a slot for a team — matches the assigned rows
  *  1:1 with a running usage_events(start) that has no usage_events(stop) yet. */
@@ -38,7 +38,7 @@ export interface EffectivePlan {
 }
 
 /** A team's current plan caps, with the free-trial-expiry rule applied. */
-async function effectivePlan(teamId: string): Promise<EffectivePlan> {
+export async function effectivePlan(teamId: string): Promise<EffectivePlan> {
   const team = await one<{ plan_tier: PlanTier; trial_ends_at: string }>(
     'SELECT plan_tier, trial_ends_at FROM teams WHERE id = $1', [teamId],
   );
