@@ -11,6 +11,10 @@ export interface AgentHealth {
   ramUsedMb: number;
   activeVmCount: number;
   draining: boolean;
+  // Cumulative registry-cache counters, undefined when the host's registry
+  // debug endpoint is off/unreachable.
+  cacheLookups?: number;
+  cacheHits?: number;
 }
 
 export class AgentError extends Error {
@@ -70,12 +74,13 @@ export class AgentClient {
   async health(): Promise<AgentHealth> {
     const res = await agentFetch<{
       cpu_total: number; cpu_used: number; ram_total_mb: number; ram_used_mb: number;
-      active_vm_count: number; draining: boolean;
+      active_vm_count: number; draining: boolean; cache_lookups?: number; cache_hits?: number;
     }>(this.endpoint, this.token, '/health', { timeoutMs: 5000 });
     return {
       cpuTotal: res.cpu_total, cpuUsed: res.cpu_used,
       ramTotalMb: res.ram_total_mb, ramUsedMb: res.ram_used_mb,
       activeVmCount: res.active_vm_count, draining: res.draining,
+      cacheLookups: res.cache_lookups, cacheHits: res.cache_hits,
     };
   }
 }

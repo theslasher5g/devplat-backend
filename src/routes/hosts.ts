@@ -111,18 +111,26 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
           ramUsedMb: { type: 'integer', minimum: 0 },
           activeVmCount: { type: 'integer', minimum: 0 },
           draining: { type: 'boolean' },
+          cacheLookups: { type: 'integer', minimum: 0 },
+          cacheHits: { type: 'integer', minimum: 0 },
         },
       },
     },
   }, async (req) => {
-    const { cpuUsed, ramUsedMb, draining } = req.body as {
+    const { cpuUsed, ramUsedMb, draining, cacheLookups, cacheHits } = req.body as {
       cpuUsed: number; ramUsedMb: number; activeVmCount: number; draining?: boolean;
+      cacheLookups?: number; cacheHits?: number;
     };
+    // Cache counters are optional (absent when the host's registry debug
+    // endpoint is off). COALESCE keeps the last known values instead of
+    // nulling them on a heartbeat that happened to omit them.
     await query(
       `UPDATE hosts SET last_heartbeat = now(), cpu_used = $1, ram_used_mb = $2,
-              status = $3
-       WHERE id = $4`,
-      [cpuUsed, ramUsedMb, draining ? 'draining' : 'online', req.hostId],
+              status = $3,
+              cache_lookups = COALESCE($4, cache_lookups),
+              cache_hits = COALESCE($5, cache_hits)
+       WHERE id = $6`,
+      [cpuUsed, ramUsedMb, draining ? 'draining' : 'online', cacheLookups ?? null, cacheHits ?? null, req.hostId],
     );
     return { ok: true };
   });

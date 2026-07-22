@@ -25,9 +25,14 @@ export async function pollHostHealth(): Promise<void> {
     if (!client) return;
     try {
       const health = await client.health();
+      // COALESCE so a poll that couldn't read cache stats keeps the last known
+      // counters rather than nulling them.
       await query(
-        `UPDATE hosts SET status = $1, cpu_used = $2, ram_used_mb = $3, last_heartbeat = now() WHERE id = $4`,
-        [health.draining ? 'draining' : 'online', health.cpuUsed, health.ramUsedMb, host.id],
+        `UPDATE hosts SET status = $1, cpu_used = $2, ram_used_mb = $3, last_heartbeat = now(),
+                cache_lookups = COALESCE($4, cache_lookups), cache_hits = COALESCE($5, cache_hits)
+         WHERE id = $6`,
+        [health.draining ? 'draining' : 'online', health.cpuUsed, health.ramUsedMb,
+          health.cacheLookups ?? null, health.cacheHits ?? null, host.id],
       );
     } catch {
       const staleSeconds = host.last_heartbeat

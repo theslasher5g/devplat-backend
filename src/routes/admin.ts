@@ -126,8 +126,16 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       `SELECT count(*) FROM hosts WHERE last_heartbeat > now() - ($1 || ' seconds')::interval`,
       [String(config.agentHeartbeatTimeoutSeconds)],
     );
+    // Pooled image-cache hit rate: sum hits / sum lookups across all hosts
+    // that have reported cache counters (NULL for hosts whose registry debug
+    // endpoint is off). Null when no host has reported any lookups yet.
+    const cache = await query<{ lookups: string | null; hits: string | null }>(
+      'SELECT sum(cache_lookups) AS lookups, sum(cache_hits) AS hits FROM hosts WHERE cache_lookups IS NOT NULL',
+    );
     const startCount = Number(starts.rows[0].count);
     const failCount = Number(failures.rows[0].count);
+    const cacheLookups = Number(cache.rows[0].lookups ?? 0);
+    const cacheHits = Number(cache.rows[0].hits ?? 0);
     return {
       totalTeams: Number(teams.rows[0].count),
       activeSubscriptions: Number(activeSubs.rows[0].count),
@@ -135,8 +143,9 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       vmStarts7d: startCount,
       vmStartFailures7d: failCount,
       vmStartErrorRate7d: startCount + failCount > 0 ? failCount / (startCount + failCount) : null,
-      // Requires the data plane's registry proxy — no source for this yet.
-      cacheHitRate: null,
+      // Real pooled cache hit rate from the hosts' registry proxies; null
+      // until at least one host reports lookups.
+      cacheHitRate: cacheLookups > 0 ? cacheHits / cacheLookups : null,
       dataPlaneConnected: Number(connected.rows[0].count) > 0,
     };
   });
