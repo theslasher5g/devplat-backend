@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { query } from '../db.js';
+import { recordComponentStatuses } from '../lib/status.js';
 import { clientForHost } from './agentClient.js';
 
 interface HostRow {
@@ -47,7 +48,12 @@ export async function pollHostHealth(): Promise<void> {
 
 export function startHealthPoller(intervalMs: number): () => void {
   const timer = setInterval(() => {
-    pollHostHealth().catch((err) => console.error('[scheduler] health poll tick failed', err));
+    // Reconcile host health first, then snapshot any derived-status change into
+    // the status history. Chained so the recording sees the freshly-updated
+    // hosts.status; both failures are logged, neither stops the interval.
+    pollHostHealth()
+      .then(() => recordComponentStatuses())
+      .catch((err) => console.error('[scheduler] health poll tick failed', err));
   }, intervalMs);
   return () => clearInterval(timer);
 }

@@ -48,6 +48,45 @@ async function effectiveComponentStatus(c: ComponentRow, computeStatus: StatusLe
   return 'operational'; // 'api': if this code runs, the API is up
 }
 
+/**
+ * Append a transition to status_component_events for every derived/manual
+ * component whose effective status changed since its last recorded event.
+ * Called by the health poller each tick, so both auto-detected compute
+ * outages and admin manual overrides land in the history within one poll
+ * interval — without any per-poll snapshot noise (a row is written only on an
+ * actual change). Incidents are NOT recorded here; they already live in
+ * status_posts and are unioned in by componentHistories.
+ *
+ * The 'api' component is deliberately never logged: effectiveComponentStatus
+ * reports it operational whenever this code runs (if the API were down,
+ * nothing here would execute to record it), so an API outage is an admin
+ * incident post, not an auto-event.
+ */
+export async function recordComponentStatuses(): Promise<void> {
+  const [componentRows, computeStatus] = await Promise.all([
+    query<ComponentRow>('SELECT key, name, source, manual_status, position, group_name FROM status_components'),
+    deriveComputeStatus(),
+  ]);
+  for (const c of componentRows.rows) {
+    const status = await effectiveComponentStatus(c, computeStatus);
+    const last = await query<{ status: StatusLevel }>(
+      'SELECT status FROM status_component_events WHERE component_key = $1 ORDER BY changed_at DESC LIMIT 1',
+      [c.key],
+    );
+    const prev = last.rows[0]?.status;
+    // First-ever sight of a component: only start the log once it's actually
+    // impaired. Logging a baseline "operational since the beginning of time"
+    // adds nothing (absence of events already means operational).
+    if (prev === undefined) {
+      if (status !== 'operational') {
+        await query('INSERT INTO status_component_events (component_key, status) VALUES ($1, $2)', [c.key, status]);
+      }
+    } else if (prev !== status) {
+      await query('INSERT INTO status_component_events (component_key, status) VALUES ($1, $2)', [c.key, status]);
+    }
+  }
+}
+
 export interface StatusPost {
   id: string; type: 'incident' | 'maintenance' | 'announcement'; title: string; body: string;
   impact: string; state: string; affectedComponents: string[];
@@ -115,15 +154,47 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * The final (today) bar also folds in the component's current live status
  * (e.g. a host down right now with no incident posted yet).
  */
+// A span of impaired time for one component, from either source (an incident
+// post or an auto/manual status event). Half-open [start, end).
+interface Impairment { keys: Set<string>; start: number; end: number; level: StatusLevel }
+
+/** Sum the length of the union of the given intervals (already filtered to the
+ *  ones that count as downtime), so overlapping spans from different sources —
+ *  e.g. an auto-detected outage that was ALSO posted as an incident — are
+ *  counted once, not twice. */
+function unionLength(intervals: { start: number; end: number }[]): number {
+  const spans = intervals.filter((i) => i.end > i.start).sort((a, b) => a.start - b.start);
+  let total = 0;
+  let curStart = -1;
+  let curEnd = -1;
+  for (const { start, end } of spans) {
+    if (start > curEnd) {
+      if (curEnd > curStart) total += curEnd - curStart;
+      curStart = start;
+      curEnd = end;
+    } else if (end > curEnd) {
+      curEnd = end;
+    }
+  }
+  if (curEnd > curStart) total += curEnd - curStart;
+  return total;
+}
+
 async function componentHistories(
-  // Each entry matches posts affecting ANY of its keys (a single component has
-  // one key; a group has all its members' keys, so it's impaired whenever any
-  // member is). `status` is the entry's current live status, folded into today.
+  // Each entry matches impairments affecting ANY of its keys (a single
+  // component has one key; a group has all its members' keys, so it's impaired
+  // whenever any member is). `status` is the entry's current live status,
+  // folded into today.
   entries: { id: string; keys: string[]; status: StatusLevel }[],
   windowStart: Date,
   windowEnd: Date,
 ): Promise<Map<string, { uptime: number; history: DayStatus[] }>> {
-  const rows = await query<{
+  const startMs = windowStart.getTime();
+  const endMs = windowEnd.getTime();
+  const nowMs = Date.now();
+
+  // Source 1 — admin-posted incidents/maintenance overlapping the window.
+  const postRows = await query<{
     type: string; impact: string; affected_components: string[]; created_at: string; resolved_at: string | null;
   }>(
     `SELECT type, impact, affected_components, created_at, resolved_at
@@ -134,40 +205,74 @@ async function componentHistories(
     [windowStart.toISOString(), windowEnd.toISOString()],
   );
 
-  const days = Math.round((windowEnd.getTime() - windowStart.getTime()) / DAY_MS);
-  const nowMs = Date.now();
+  // Source 2 — the auto/manual status transition log. Fetch every event up to
+  // the window end (transitions are sparse), ordered per component, so each
+  // component's status timeline can be reconstructed including the event that
+  // was already in effect when the window opened.
+  const eventRows = await query<{ component_key: string; status: StatusLevel; changed_at: string }>(
+    `SELECT component_key, status, changed_at
+     FROM status_component_events
+     WHERE changed_at < $1
+     ORDER BY component_key, changed_at`,
+    [windowEnd.toISOString()],
+  );
+
+  // Build the flat list of impairments (non-operational spans), clamped to the
+  // window, from both sources.
+  const impairments: Impairment[] = [];
+  for (const p of postRows.rows) {
+    const lvl = postLevel(p.type, p.impact);
+    if (lvl === 'operational') continue;
+    const s = Math.max(startMs, new Date(p.created_at).getTime());
+    const e = Math.min(endMs, p.resolved_at ? new Date(p.resolved_at).getTime() : nowMs);
+    if (e > s) impairments.push({ keys: new Set(p.affected_components), start: s, end: e, level: lvl });
+  }
+  // Turn the per-component event stream into spans: each event runs until the
+  // next event for the same component (or now, if it's the latest).
+  const byKey = new Map<string, { status: StatusLevel; at: number }[]>();
+  for (const ev of eventRows.rows) {
+    const list = byKey.get(ev.component_key) ?? [];
+    list.push({ status: ev.status, at: new Date(ev.changed_at).getTime() });
+    byKey.set(ev.component_key, list);
+  }
+  for (const [key, evs] of byKey) {
+    for (let i = 0; i < evs.length; i++) {
+      if (evs[i].status === 'operational') continue; // a recovery ends a span, doesn't start one
+      const spanStart = Math.max(startMs, evs[i].at);
+      const spanEnd = Math.min(endMs, i + 1 < evs.length ? evs[i + 1].at : nowMs);
+      if (spanEnd > spanStart) {
+        impairments.push({ keys: new Set([key]), start: spanStart, end: spanEnd, level: evs[i].status });
+      }
+    }
+  }
+
+  const days = Math.round((endMs - startMs) / DAY_MS);
   const out = new Map<string, { uptime: number; history: DayStatus[] }>();
 
   for (const entry of entries) {
     const keySet = new Set(entry.keys);
-    const posts = rows.rows.filter((p) => p.affected_components.some((k) => keySet.has(k)));
+    const mine = impairments.filter((im) => [...im.keys].some((k) => keySet.has(k)));
     const history: DayStatus[] = [];
-    let downtimeMs = 0;
 
     for (let i = 0; i < days; i++) {
-      const dayStart = windowStart.getTime() + i * DAY_MS;
+      const dayStart = startMs + i * DAY_MS;
       const dayEnd = dayStart + DAY_MS;
       let level: StatusLevel = 'operational';
-      for (const p of posts) {
-        const s = new Date(p.created_at).getTime();
-        const e = p.resolved_at ? new Date(p.resolved_at).getTime() : nowMs;
-        if (s < dayEnd && e > dayStart) {
-          const lvl = postLevel(p.type, p.impact);
-          if (RANK[lvl] > RANK[level]) level = lvl;
-          // Accumulate downtime for outages (red), clamped to this day.
-          if (lvl === 'partial_outage' || lvl === 'major_outage') {
-            downtimeMs += Math.min(e, dayEnd) - Math.max(s, dayStart);
-          }
-        }
+      for (const im of mine) {
+        if (im.start < dayEnd && im.end > dayStart && RANK[im.level] > RANK[level]) level = im.level;
       }
-      // Today's bar also reflects the live status.
+      // Today's bar also reflects the live status (e.g. a host down right now
+      // whose transition hasn't been recorded by the poller yet).
       const isToday = dayEnd > nowMs && dayStart <= nowMs;
       if (isToday && RANK[entry.status] > RANK[level]) level = entry.status;
       history.push({ date: new Date(dayStart).toISOString().slice(0, 10), status: level });
     }
 
-    // Only count elapsed time (don't penalize the future part of today's window).
-    const elapsedMs = Math.min(windowEnd.getTime(), nowMs) - windowStart.getTime();
+    // Uptime counts only real downtime (partial/major outages), unioned across
+    // sources so a doubly-recorded outage isn't penalised twice. Maintenance
+    // and minor degradation don't reduce it, matching standard reporting.
+    const downtimeMs = unionLength(mine.filter((im) => im.level === 'partial_outage' || im.level === 'major_outage'));
+    const elapsedMs = Math.min(endMs, nowMs) - startMs;
     const uptime = elapsedMs > 0 ? Math.max(0, 1 - downtimeMs / elapsedMs) * 100 : 100;
     out.set(entry.id, { uptime, history });
   }
