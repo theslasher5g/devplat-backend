@@ -84,6 +84,58 @@ export default async function environmentRoutes(app: FastifyInstance): Promise<v
     };
   });
 
+  // Past runs (released or failed) for the dashboard's environment history —
+  // the live /environments list only shows queued/assigned. Duration is the
+  // assigned→released span (null while it never got assigned, e.g. a failure).
+  app.get('/environments/history', { preHandler: requireApiTokenOrUser }, async (req) => {
+    const teamId = teamIdOf(req);
+    const res = await query<{
+      id: string; status: string; vm_id: string | null; error: string | null;
+      requested_at: string; assigned_at: string | null; released_at: string | null;
+      host_name: string | null; region: string | null; duration_seconds: number | null;
+    }>(
+      `SELECT er.id, er.status, er.vm_id, er.error, er.requested_at, er.assigned_at, er.released_at,
+              h.name AS host_name, h.location AS region,
+              CASE WHEN er.assigned_at IS NOT NULL
+                   THEN EXTRACT(EPOCH FROM (COALESCE(er.released_at, now()) - er.assigned_at))::int
+                   END AS duration_seconds
+       FROM environment_requests er LEFT JOIN hosts h ON h.id = er.host_id
+       WHERE er.team_id = $1 AND er.status IN ('released', 'failed')
+       ORDER BY er.requested_at DESC LIMIT 30`,
+      [teamId],
+    );
+    return {
+      runs: res.rows.map((r) => ({
+        requestId: r.id, status: r.status, vmId: r.vm_id, error: r.error,
+        requestedAt: r.requested_at, assignedAt: r.assigned_at, releasedAt: r.released_at,
+        hostName: r.host_name, region: r.region, durationSeconds: r.duration_seconds,
+      })),
+    };
+  });
+
+  // Team-scoped daily VM-start activity for the dashboard usage chart. Same
+  // gap-free generate_series shape as the admin timeseries, but only this
+  // team's starts + failed starts.
+  app.get('/environments/usage', { preHandler: requireApiTokenOrUser }, async (req) => {
+    const teamId = teamIdOf(req);
+    const raw = Number((req.query as { days?: string }).days ?? 14);
+    const days = Number.isFinite(raw) ? Math.max(1, Math.min(90, Math.trunc(raw))) : 14;
+    const res = await query<{ day: string; starts: string; failures: string }>(
+      `WITH d AS (
+         SELECT generate_series(date_trunc('day', now()) - ($1::int - 1) * interval '1 day',
+                                date_trunc('day', now()), interval '1 day') AS day
+       )
+       SELECT to_char(d.day, 'YYYY-MM-DD') AS day,
+              (SELECT count(*) FROM usage_events ue WHERE ue.team_id = $2 AND ue.event_type = 'start'
+                 AND ue.occurred_at >= d.day AND ue.occurred_at < d.day + interval '1 day') AS starts,
+              (SELECT count(*) FROM usage_events ue WHERE ue.team_id = $2 AND ue.event_type = 'start_failed'
+                 AND ue.occurred_at >= d.day AND ue.occurred_at < d.day + interval '1 day') AS failures
+       FROM d ORDER BY d.day`,
+      [days, teamId],
+    );
+    return { days: res.rows.map((r) => ({ date: r.day, starts: Number(r.starts), failures: Number(r.failures) })) };
+  });
+
   app.delete('/environments/:id', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const teamId = teamIdOf(req);
