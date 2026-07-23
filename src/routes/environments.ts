@@ -15,13 +15,27 @@ function teamIdOf(req: { apiTokenTeamId?: string; membership?: { teamId: string 
  * GET /environments/:id instead of holding a long-lived connection open.
  */
 export default async function environmentRoutes(app: FastifyInstance): Promise<void> {
-  app.post('/environments', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
+  app.post('/environments', {
+    preHandler: requireApiTokenOrUser,
+    schema: {
+      tags: ['Environments'], summary: 'Request an environment',
+      description: 'Ask the scheduler for a remote microVM. Always durable — a queued result still returns a requestId to poll.',
+      security: [{ bearerToken: [] }, { sessionCookie: [] }],
+    },
+  }, async (req, reply) => {
     const teamId = teamIdOf(req);
     const result = await requestEnvironment(teamId, req.apiTokenId ?? null);
     return reply.code(result.status === 'failed' ? 502 : 202).send(result);
   });
 
-  app.get('/environments/:id', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
+  app.get('/environments/:id', {
+    preHandler: requireApiTokenOrUser,
+    schema: {
+      tags: ['Environments'], summary: 'Get an environment',
+      description: 'Poll a request until it is assigned; includes docker endpoint, resources, TTL, and parallel usage.',
+      security: [{ bearerToken: [] }, { sessionCookie: [] }],
+    },
+  }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const teamId = teamIdOf(req);
     const row = await maybeOne<{
@@ -68,7 +82,14 @@ export default async function environmentRoutes(app: FastifyInstance): Promise<v
     };
   });
 
-  app.get('/environments', { preHandler: requireApiTokenOrUser }, async (req) => {
+  app.get('/environments', {
+    preHandler: requireApiTokenOrUser,
+    schema: {
+      tags: ['Environments'], summary: 'List live environments',
+      description: 'The team\'s queued and assigned environments.',
+      security: [{ bearerToken: [] }, { sessionCookie: [] }],
+    },
+  }, async (req) => {
     const teamId = teamIdOf(req);
     const res = await query<{
       id: string; status: string; vm_id: string | null; docker_endpoint: string | null; requested_at: string;
@@ -181,7 +202,14 @@ export default async function environmentRoutes(app: FastifyInstance): Promise<v
     }
   });
 
-  app.delete('/environments/:id', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
+  app.delete('/environments/:id', {
+    preHandler: requireApiTokenOrUser,
+    schema: {
+      tags: ['Environments'], summary: 'Release an environment',
+      description: 'Tear down the microVM and free the slot. Idempotent-ish: releasing an unknown id 404s.',
+      security: [{ bearerToken: [] }, { sessionCookie: [] }],
+    },
+  }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const teamId = teamIdOf(req);
     const result = await releaseEnvironment(teamId, id);
