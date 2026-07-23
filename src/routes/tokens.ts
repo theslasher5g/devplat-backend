@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { maybeOne, query } from '../db.js';
+import { auditFromReq } from '../lib/audit.js';
 import { generateApiToken } from '../lib/tokens.js';
 import { requireMember } from '../plugins/auth.js';
 
@@ -45,6 +46,7 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
        VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
       [req.membership.teamId, label.trim(), prefix, scope, hash],
     );
+    void auditFromReq(req, 'token.create', { target: label.trim(), detail: { scope, prefix } });
     // The plaintext token is returned exactly once and never stored.
     return reply.code(201).send({
       token,
@@ -58,11 +60,12 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
 
   app.delete('/tokens/:id', { preHandler: requireMember }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const found = await maybeOne(
-      'UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND team_id = $2 AND revoked_at IS NULL RETURNING id',
+    const found = await maybeOne<{ id: string; label: string }>(
+      'UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND team_id = $2 AND revoked_at IS NULL RETURNING id, label',
       [id, req.membership.teamId],
     );
     if (!found) return reply.code(404).send({ error: 'not_found' });
+    void auditFromReq(req, 'token.revoke', { target: found.label });
     return { ok: true };
   });
 }

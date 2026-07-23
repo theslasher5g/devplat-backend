@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { getPlan, maxFootprintGb } from '../plans.js';
+import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { sendTeamInviteEmail } from '../lib/email.js';
 import { stripe } from '../lib/stripe.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
@@ -46,12 +47,25 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
+  // Team activity log — visible to team admins/owners. Shows this team's own
+  // audit trail (tokens, members, renames, and any admin plan override applied
+  // to it), newest first.
+  app.get('/teams/me/audit', { preHandler: requireTeamAdmin }, async (req) => {
+    const res = await query<AuditRow>(
+      `SELECT id, action, target, actor_email, detail, created_at, team_id
+       FROM audit_log WHERE team_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.membership.teamId],
+    );
+    return { entries: res.rows.map(serializeAudit) };
+  });
+
   app.patch('/teams/me', {
     preHandler: requireTeamAdmin,
     schema: { body: { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 1, maxLength: 100 } } } },
   }, async (req) => {
     const { name } = req.body as { name: string };
     await query('UPDATE teams SET name = $1 WHERE id = $2', [name.trim(), req.membership.teamId]);
+    void auditFromReq(req, 'team.rename', { target: name.trim() });
     return { ok: true };
   });
 
@@ -149,6 +163,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
       [teamId, normalized, role, hash, req.user.id],
     );
     const team = await one<{ name: string }>('SELECT name FROM teams WHERE id = $1', [teamId]);
+    void auditFromReq(req, 'member.invite', { target: normalized, detail: { role } });
     // Best-effort: the invite row is already committed above.
     await sendTeamInviteEmail(normalized, token, team.name, req.user.email, role).catch((err) => {
       req.log.warn({ err }, 'team invite email failed to send');

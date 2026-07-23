@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { config, type PlanTier } from '../config.js';
 import { getPlan } from '../plans.js';
 import { query, withTransaction } from '../db.js';
+import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { stripe } from '../lib/stripe.js';
 import { requirePlatformAdmin } from '../plugins/auth.js';
 
@@ -117,8 +118,11 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
   }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const { planOverride } = req.body as { planOverride: PlanTier | null };
-    const found = await query('UPDATE teams SET plan_override = $1 WHERE id = $2 RETURNING id', [planOverride, id]);
+    const found = await query<{ name: string }>('UPDATE teams SET plan_override = $1 WHERE id = $2 RETURNING name', [planOverride, id]);
     if (found.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
+    // Audit against the team so it shows in that team's log too.
+    void auditFromReq(req, planOverride ? 'plan.override.set' : 'plan.override.clear',
+      { teamId: id, target: found.rows[0].name, detail: { planOverride } });
     return { ok: true, planOverride, planOverrideLabel: planOverride ? getPlan(planOverride).label : null };
   });
 
@@ -162,7 +166,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.delete('/admin/users/:id', { preHandler: requirePlatformAdmin }, async (req, reply) => {
     const { id } = req.params as { id: string };
     if (id === req.user.id) return reply.code(400).send({ error: 'self', detail: 'You cannot delete your own account here.' });
-    const target = await query<{ is_platform_admin: boolean }>('SELECT is_platform_admin FROM users WHERE id = $1', [id]);
+    const target = await query<{ is_platform_admin: boolean; email: string }>('SELECT is_platform_admin, email FROM users WHERE id = $1', [id]);
     if (target.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
     if (target.rows[0].is_platform_admin) {
       return reply.code(400).send({ error: 'is_admin', detail: 'Refusing to delete a platform admin.' });
@@ -182,6 +186,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         await tx.query('DELETE FROM teams WHERE id = ANY($1)', [soleTeams.rows.map((t) => t.team_id)]);
       }
     });
+    void auditFromReq(req, 'user.delete', { teamId: null, target: target.rows[0].email, detail: { userId: id, soleTeamsRemoved: soleTeams.rows.length } });
     return reply.code(204).send();
   });
 
@@ -193,7 +198,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
   // deleted paying team doesn't keep getting billed.
   app.delete('/admin/teams/:id', { preHandler: requirePlatformAdmin }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const team = await query<{ id: string }>('SELECT id FROM teams WHERE id = $1', [id]);
+    const team = await query<{ id: string; name: string }>('SELECT id, name FROM teams WHERE id = $1', [id]);
     if (team.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
     const hasAdmin = await query<{ one: number }>(
       `SELECT 1 AS one FROM team_members tm JOIN users u ON u.id = tm.user_id
@@ -220,7 +225,19 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         );
       }
     });
+    // teamId: null — the team row is gone, so anchor the record at platform
+    // level (with the name in target) instead of losing it to the cascade.
+    void auditFromReq(req, 'team.delete', { teamId: null, target: team.rows[0].name, detail: { teamId: id } });
     return reply.code(204).send();
+  });
+
+  // Platform-wide audit log — every recorded action, newest first.
+  app.get('/admin/audit', { preHandler: requirePlatformAdmin }, async () => {
+    const res = await query<AuditRow>(
+      `SELECT id, action, target, actor_email, detail, created_at, team_id
+       FROM audit_log ORDER BY created_at DESC LIMIT 100`,
+    );
+    return { entries: res.rows.map(serializeAudit) };
   });
 
   app.get('/admin/overview', { preHandler: requirePlatformAdmin }, async () => {
