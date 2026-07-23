@@ -1,9 +1,10 @@
 import type { FastifyInstance } from 'fastify';
-import { type PlanTier } from '../config.js';
+import { config, type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { getPlan, maxFootprintGb } from '../plans.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { sendTeamInviteEmail } from '../lib/email.js';
+import { getOrCreateReferralCode } from '../lib/referral.js';
 import { stripe } from '../lib/stripe.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { SESSION_COOKIE, requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser, sessionCookieOptions } from '../plugins/auth.js';
@@ -44,6 +45,25 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
       },
       members: members.rows.map((m) => ({ userId: m.user_id, email: m.email, role: m.role, joinedAt: m.created_at })),
       pendingInvites: invites.rows.map((i) => ({ id: i.id, email: i.email, role: i.role, expiresAt: i.expires_at })),
+    };
+  });
+
+  // Referral programme: the team's shareable code + link, and how many teams
+  // they've referred (pending vs. rewarded with a free month). Any member can
+  // see and share it.
+  app.get('/teams/me/referral', { preHandler: requireMember }, async (req) => {
+    const teamId = req.membership.teamId;
+    const code = await getOrCreateReferralCode(teamId);
+    const stats = await query<{ status: string; count: string }>(
+      'SELECT status, count(*) AS count FROM referrals WHERE referrer_team_id = $1 GROUP BY status',
+      [teamId],
+    );
+    const byStatus = Object.fromEntries(stats.rows.map((r) => [r.status, Number(r.count)]));
+    return {
+      code,
+      shareUrl: `${config.frontendUrl}/auth?ref=${code}`,
+      pending: byStatus.pending ?? 0,
+      rewarded: byStatus.rewarded ?? 0,
     };
   });
 

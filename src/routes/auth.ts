@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { maybeOne, query, withTransaction } from '../db.js';
 import { sendPasswordResetEmail, sendVerificationEmail } from '../lib/email.js';
 import { hashPassword, verifyPassword } from '../lib/passwords.js';
+import { linkReferral } from '../lib/referral.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { getPlan } from '../plans.js';
 import { SESSION_COOKIE, requireUser, sessionCookieOptions, signSession } from '../plugins/auth.js';
@@ -13,6 +14,7 @@ const credentialsSchema = {
     email: { type: 'string', format: 'email', maxLength: 255 },
     password: { type: 'string', minLength: 10, maxLength: 200 },
     teamName: { type: 'string', minLength: 1, maxLength: 100 },
+    referralCode: { type: 'string', maxLength: 32 },
   },
 } as const;
 
@@ -36,7 +38,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     // address's inbox via the verification mail.
     config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
   }, async (req, reply) => {
-    const { email, password, teamName } = req.body as { email: string; password: string; teamName?: string };
+    const { email, password, teamName, referralCode } = req.body as { email: string; password: string; teamName?: string; referralCode?: string };
     const normalized = email.trim().toLowerCase();
 
     const existing = await maybeOne('SELECT 1 FROM users WHERE email = $1', [normalized]);
@@ -55,6 +57,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
         [normalized, passwordHash],
       );
       const userId = u.rows[0].id;
+      let teamId: string | null = null;
       if (!pendingInvite) {
         // Trial length comes from the free plan's trial_duration_days (the
         // plans table is the single source of truth), not the teams column's
@@ -71,13 +74,20 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
               'INSERT INTO teams (name) VALUES ($1) RETURNING id',
               [teamName?.trim() || normalized.split('@')[0]],
             );
+        teamId = team.rows[0].id;
         await tx.query(
           "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')",
-          [team.rows[0].id, userId],
+          [teamId, userId],
         );
       }
-      return { id: userId };
+      return { id: userId, teamId };
     });
+
+    // Link a referral if a valid code was supplied and a fresh team was created
+    // (invite signups join an existing team and can't be referred). Best-effort.
+    if (referralCode?.trim() && user.teamId) {
+      await linkReferral(referralCode, user.teamId);
+    }
 
     const token = await createOneTimeToken(user.id, 'verify_email');
     // Best-effort: the account is already committed above, so a Resend

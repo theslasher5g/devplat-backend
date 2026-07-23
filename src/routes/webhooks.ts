@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type Stripe from 'stripe';
 import { config, tierForPrice } from '../config.js';
 import { maybeOne, query } from '../db.js';
+import { rewardReferralOnSubscription } from '../lib/referral.js';
 import { requireStripe } from '../lib/stripe.js';
 
 async function teamIdForEvent(obj: { metadata?: Stripe.Metadata | null; customer?: string | Stripe.Customer | Stripe.DeletedCustomer | null }): Promise<string | null> {
@@ -36,6 +37,13 @@ async function syncSubscription(teamId: string, sub: Stripe.Subscription): Promi
   const paidStatus = sub.status === 'active' || sub.status === 'trialing' || sub.status === 'past_due';
   const tier = paidStatus && mapped ? mapped.tier : 'free';
   await query('UPDATE teams SET plan_tier = $1 WHERE id = $2', [tier, teamId]);
+
+  // Becoming a real paying customer (active, on a mapped paid tier) is what
+  // fulfils a pending referral — reward both teams with a free month. Idempotent
+  // (only pending referrals are rewarded), best-effort, never blocks the webhook.
+  if (sub.status === 'active' && mapped) {
+    await rewardReferralOnSubscription(teamId).catch((err) => console.error('[referral] reward failed', err));
+  }
 }
 
 export default async function webhookRoutes(app: FastifyInstance): Promise<void> {
