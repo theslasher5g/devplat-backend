@@ -224,7 +224,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get('/admin/overview', { preHandler: requirePlatformAdmin }, async () => {
-    const [teams, activeSubs, starts, failures] = await Promise.all([
+    const [teams, activeSubs, starts, failures, newTeams, running, queued] = await Promise.all([
       query<{ count: string }>('SELECT count(*) FROM teams'),
       query<{ count: string }>("SELECT count(*) FROM subscriptions WHERE status IN ('active', 'trialing')"),
       query<{ count: string }>(
@@ -233,6 +233,9 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       query<{ count: string }>(
         "SELECT count(*) FROM usage_events WHERE event_type = 'start_failed' AND occurred_at > now() - interval '7 days'",
       ),
+      query<{ count: string }>("SELECT count(*) FROM teams WHERE created_at > now() - interval '7 days'"),
+      query<{ count: string }>("SELECT count(*) FROM environment_requests WHERE status = 'assigned'"),
+      query<{ count: string }>("SELECT count(*) FROM environment_requests WHERE status IN ('queued', 'assigning')"),
     ]);
     const mrr = await query<{ plan_tier: PlanTier; count: string }>(
       "SELECT plan_tier, count(*) FROM teams WHERE plan_tier != 'free' GROUP BY plan_tier",
@@ -255,17 +258,87 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     const failCount = Number(failures.rows[0].count);
     const cacheLookups = Number(cache.rows[0].lookups ?? 0);
     const cacheHits = Number(cache.rows[0].hits ?? 0);
+    // MRR split by tier, so the number isn't just one opaque total.
+    const mrrByTier = mrr.rows
+      .map((r) => {
+        const plan = getPlan(r.plan_tier);
+        const count = Number(r.count);
+        return { tier: r.plan_tier, label: plan.label, count, chfEach: plan.chfMonthly, chfTotal: plan.chfMonthly * count };
+      })
+      .sort((a, b) => b.chfTotal - a.chfTotal);
     return {
       totalTeams: Number(teams.rows[0].count),
+      newTeams7d: Number(newTeams.rows[0].count),
       activeSubscriptions: Number(activeSubs.rows[0].count),
-      mrrChf: mrr.rows.reduce((sum, r) => sum + getPlan(r.plan_tier).chfMonthly * Number(r.count), 0),
+      mrrChf: mrrByTier.reduce((sum, r) => sum + r.chfTotal, 0),
+      mrrByTier,
       vmStarts7d: startCount,
       vmStartFailures7d: failCount,
       vmStartErrorRate7d: startCount + failCount > 0 ? failCount / (startCount + failCount) : null,
+      runningEnvironments: Number(running.rows[0].count),
+      queuedEnvironments: Number(queued.rows[0].count),
       // Real pooled cache hit rate from the hosts' registry proxies; null
       // until at least one host reports lookups.
       cacheHitRate: cacheLookups > 0 ? cacheHits / cacheLookups : null,
       dataPlaneConnected: Number(connected.rows[0].count) > 0,
+    };
+  });
+
+  // Recent activity feed for the overview: latest signups and the most recent
+  // failed VM starts (the two things an admin most wants to notice quickly).
+  app.get('/admin/activity', { preHandler: requirePlatformAdmin }, async () => {
+    const [signups, failures] = await Promise.all([
+      query<{ id: string; name: string; plan_tier: PlanTier; created_at: string; owner_email: string | null; owner_verified: boolean | null }>(
+        `SELECT t.id, t.name, t.plan_tier, t.created_at,
+                (SELECT u.email FROM team_members tm JOIN users u ON u.id = tm.user_id
+                   WHERE tm.team_id = t.id AND tm.role = 'owner' LIMIT 1) AS owner_email,
+                (SELECT u.email_verified_at IS NOT NULL FROM team_members tm JOIN users u ON u.id = tm.user_id
+                   WHERE tm.team_id = t.id AND tm.role = 'owner' LIMIT 1) AS owner_verified
+         FROM teams t ORDER BY t.created_at DESC LIMIT 8`,
+      ),
+      query<{ id: string; team_name: string; vm_id: string | null; occurred_at: string }>(
+        `SELECT ue.id, t.name AS team_name, ue.vm_id, ue.occurred_at
+         FROM usage_events ue JOIN teams t ON t.id = ue.team_id
+         WHERE ue.event_type = 'start_failed'
+         ORDER BY ue.occurred_at DESC LIMIT 8`,
+      ),
+    ]);
+    return {
+      recentSignups: signups.rows.map((s) => ({
+        id: s.id, name: s.name, planLabel: getPlan(s.plan_tier).label,
+        ownerEmail: s.owner_email, ownerVerified: s.owner_verified ?? false, createdAt: s.created_at,
+      })),
+      recentFailures: failures.rows.map((f) => ({
+        id: f.id, teamName: f.team_name, vmId: f.vm_id, occurredAt: f.occurred_at,
+      })),
+    };
+  });
+
+  // Daily activity for the overview chart: VM starts, failed starts, and new
+  // signups per day over the last `days` (default 14, capped at 90).
+  app.get('/admin/timeseries', { preHandler: requirePlatformAdmin }, async (req) => {
+    const raw = Number((req.query as { days?: string }).days ?? 14);
+    const days = Number.isFinite(raw) ? Math.max(1, Math.min(90, Math.trunc(raw))) : 14;
+    // generate_series gives a row per day even when nothing happened, so the
+    // chart has no gaps. All in UTC to match the rest of the status tooling.
+    const res = await query<{ day: string; starts: string; failures: string; signups: string }>(
+      `WITH d AS (
+         SELECT generate_series(date_trunc('day', now()) - ($1::int - 1) * interval '1 day',
+                                date_trunc('day', now()), interval '1 day') AS day
+       )
+       SELECT to_char(d.day, 'YYYY-MM-DD') AS day,
+              (SELECT count(*) FROM usage_events ue WHERE ue.event_type = 'start'
+                 AND ue.occurred_at >= d.day AND ue.occurred_at < d.day + interval '1 day') AS starts,
+              (SELECT count(*) FROM usage_events ue WHERE ue.event_type = 'start_failed'
+                 AND ue.occurred_at >= d.day AND ue.occurred_at < d.day + interval '1 day') AS failures,
+              (SELECT count(*) FROM teams t WHERE t.created_at >= d.day AND t.created_at < d.day + interval '1 day') AS signups
+       FROM d ORDER BY d.day`,
+      [days],
+    );
+    return {
+      days: res.rows.map((r) => ({
+        date: r.day, starts: Number(r.starts), failures: Number(r.failures), signups: Number(r.signups),
+      })),
     };
   });
 }
