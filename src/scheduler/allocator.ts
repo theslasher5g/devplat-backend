@@ -166,10 +166,10 @@ export async function reclaimStaleAssignments(staleAfterMs = 3 * 60_000): Promis
 
 /** Entry point for POST /environments. Always durable (a queue row exists
  *  immediately), assigns synchronously when capacity allows. */
-export async function requestEnvironment(teamId: string): Promise<EnvironmentResult> {
+export async function requestEnvironment(teamId: string, tokenId: string | null = null): Promise<EnvironmentResult> {
   const request = await one<{ id: string }>(
-    "INSERT INTO environment_requests (team_id, status) VALUES ($1, 'queued') RETURNING id",
-    [teamId],
+    "INSERT INTO environment_requests (team_id, status, token_id) VALUES ($1, 'queued', $2) RETURNING id",
+    [teamId, tokenId],
   );
 
   const [plan, running] = await Promise.all([effectivePlan(teamId), runningCount(teamId)]);

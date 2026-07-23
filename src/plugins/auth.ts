@@ -24,6 +24,8 @@ declare module 'fastify' {
     membership: Membership;
     /** Set when the request authenticated with an API token instead of a session. */
     apiTokenTeamId?: string;
+    /** The API token's id, when authenticated with one (for usage attribution). */
+    apiTokenId?: string;
     /** Set when the request authenticated with a devplat-agent host token. */
     hostId?: string;
   }
@@ -134,6 +136,7 @@ export async function requireApiTokenOrUser(req: FastifyRequest, reply: FastifyR
     }
     await query('UPDATE api_tokens SET last_used_at = now() WHERE id = $1', [row.id]);
     req.apiTokenTeamId = row.team_id;
+    req.apiTokenId = row.id;
     return;
   }
   return requireMember(req, reply);

@@ -6,23 +6,55 @@ import { requireMember } from '../plugins/auth.js';
 
 export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
   app.get('/tokens', { preHandler: requireMember }, async (req) => {
-    const res = await query<{
-      id: string; label: string; token_prefix: string; scope: string;
-      created_at: string; last_used_at: string | null;
-    }>(
-      `SELECT id, label, token_prefix, scope, created_at, last_used_at
-       FROM api_tokens WHERE team_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC`,
-      [req.membership.teamId],
-    );
+    const teamId = req.membership.teamId;
+    const SPARK_DAYS = 14;
+    const [res, runs] = await Promise.all([
+      query<{
+        id: string; label: string; token_prefix: string; scope: string;
+        created_at: string; last_used_at: string | null;
+      }>(
+        `SELECT id, label, token_prefix, scope, created_at, last_used_at
+         FROM api_tokens WHERE team_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC`,
+        [teamId],
+      ),
+      // Per-token run counts per day over the window, for the usage sparkline.
+      query<{ token_id: string; day: string; count: string }>(
+        `SELECT token_id, to_char(date_trunc('day', requested_at), 'YYYY-MM-DD') AS day, count(*) AS count
+         FROM environment_requests
+         WHERE team_id = $1 AND token_id IS NOT NULL
+           AND requested_at >= date_trunc('day', now()) - ($2::int - 1) * interval '1 day'
+         GROUP BY token_id, day`,
+        [teamId, SPARK_DAYS],
+      ),
+    ]);
+
+    // Build a gap-free day axis, then bucket each token's counts onto it.
+    const axis: string[] = [];
+    for (let i = SPARK_DAYS - 1; i >= 0; i--) {
+      axis.push(new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10));
+    }
+    const byToken = new Map<string, Map<string, number>>();
+    for (const r of runs.rows) {
+      const m = byToken.get(r.token_id) ?? new Map<string, number>();
+      m.set(r.day, Number(r.count));
+      byToken.set(r.token_id, m);
+    }
+
     return {
-      tokens: res.rows.map((t) => ({
-        id: t.id,
-        label: t.label,
-        prefix: t.token_prefix,
-        scope: t.scope,
-        createdAt: t.created_at,
-        lastUsedAt: t.last_used_at,
-      })),
+      tokens: res.rows.map((t) => {
+        const m = byToken.get(t.id);
+        const usage = axis.map((d) => m?.get(d) ?? 0);
+        return {
+          id: t.id,
+          label: t.label,
+          prefix: t.token_prefix,
+          scope: t.scope,
+          createdAt: t.created_at,
+          lastUsedAt: t.last_used_at,
+          usage, // 14 daily run counts, oldest→newest
+          runsTotal: usage.reduce((a, b) => a + b, 0),
+        };
+      }),
     };
   });
 

@@ -17,7 +17,7 @@ function teamIdOf(req: { apiTokenTeamId?: string; membership?: { teamId: string 
 export default async function environmentRoutes(app: FastifyInstance): Promise<void> {
   app.post('/environments', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
     const teamId = teamIdOf(req);
-    const result = await requestEnvironment(teamId);
+    const result = await requestEnvironment(teamId, req.apiTokenId ?? null);
     return reply.code(result.status === 'failed' ? 502 : 202).send(result);
   });
 
