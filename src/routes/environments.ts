@@ -136,6 +136,51 @@ export default async function environmentRoutes(app: FastifyInstance): Promise<v
     return { days: res.rows.map((r) => ({ date: r.day, starts: Number(r.starts), failures: Number(r.failures) })) };
   });
 
+  // Live container list for an assigned environment — powers the dashboard's
+  // detail drawer. The backend is on the WireGuard mesh, so it can reach the
+  // VM's Docker API at docker_endpoint directly (the same endpoint the tunnel
+  // relays to). Best-effort: a VM that's mid-boot or gone returns an empty
+  // list with `reachable: false` rather than erroring the whole drawer.
+  app.get('/environments/:id/containers', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const teamId = teamIdOf(req);
+    const row = await maybeOne<{ status: string; docker_endpoint: string | null }>(
+      'SELECT status, docker_endpoint FROM environment_requests WHERE id = $1 AND team_id = $2',
+      [id, teamId],
+    );
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+    if (row.status !== 'assigned' || !row.docker_endpoint) return { reachable: false, containers: [] };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const res = await fetch(`http://${row.docker_endpoint}/containers/json?all=0`, { signal: controller.signal });
+      if (!res.ok) return { reachable: false, containers: [] };
+      const raw = (await res.json()) as {
+        Id: string; Names?: string[]; Image: string; State: string; Status: string;
+        Ports?: { PrivatePort: number; PublicPort?: number; Type: string }[];
+      }[];
+      return {
+        reachable: true,
+        containers: raw.map((c) => ({
+          id: c.Id.slice(0, 12),
+          name: (c.Names?.[0] ?? '').replace(/^\//, ''),
+          image: c.Image,
+          state: c.State,
+          status: c.Status,
+          ports: (c.Ports ?? [])
+            .filter((p) => p.Type === 'tcp' && p.PublicPort)
+            .map((p) => ({ publicPort: p.PublicPort as number, privatePort: p.PrivatePort })),
+        })),
+      };
+    } catch (err) {
+      req.log.warn({ err, envId: id }, 'container list fetch failed');
+      return { reachable: false, containers: [] };
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
   app.delete('/environments/:id', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const teamId = teamIdOf(req);
