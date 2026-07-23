@@ -37,10 +37,12 @@ export interface EffectivePlan {
   ramMb: number;
 }
 
-/** A team's current plan caps, with the free-trial-expiry rule applied. */
+/** A team's current plan caps, with the free-trial-expiry rule applied. Uses
+ *  the entitlement tier — a manual plan_override if set, else the billing
+ *  plan_tier — so an admin can grant capacity without a Stripe subscription. */
 export async function effectivePlan(teamId: string): Promise<EffectivePlan> {
   const team = await one<{ plan_tier: PlanTier; trial_ends_at: string }>(
-    'SELECT plan_tier, trial_ends_at FROM teams WHERE id = $1', [teamId],
+    'SELECT COALESCE(plan_override, plan_tier) AS plan_tier, trial_ends_at FROM teams WHERE id = $1', [teamId],
   );
   const plan = getPlan(team.plan_tier);
   const trialExpired = team.plan_tier === 'free' && new Date(team.trial_ends_at) < new Date();

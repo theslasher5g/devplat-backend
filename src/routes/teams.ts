@@ -9,8 +9,11 @@ import { SESSION_COOKIE, requireApiTokenOrUser, requireMember, requireTeamAdmin,
 
 export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   app.get('/teams/me', { preHandler: requireMember }, async (req) => {
+    // Entitlement view: the effective tier (a manual plan_override if set, else
+    // the billing plan_tier) drives the caps shown here. The billing plan and
+    // its subscription state live under /billing/subscription.
     const team = await one<{ id: string; name: string; plan_tier: PlanTier; trial_ends_at: string; created_at: string }>(
-      'SELECT id, name, plan_tier, trial_ends_at, created_at FROM teams WHERE id = $1',
+      'SELECT id, name, COALESCE(plan_override, plan_tier) AS plan_tier, trial_ends_at, created_at FROM teams WHERE id = $1',
       [req.membership.teamId],
     );
     const members = await query<{ user_id: string; email: string; role: string; created_at: string }>(
@@ -100,7 +103,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     const allowedTeamId = req.apiTokenTeamId ?? req.membership.teamId;
     if (id !== allowedTeamId) return reply.code(403).send({ error: 'forbidden' });
     const team = await maybeOne<{ plan_tier: PlanTier; trial_ends_at: string }>(
-      'SELECT plan_tier, trial_ends_at FROM teams WHERE id = $1', [id],
+      'SELECT COALESCE(plan_override, plan_tier) AS plan_tier, trial_ends_at FROM teams WHERE id = $1', [id],
     );
     if (!team) return reply.code(404).send({ error: 'not_found' });
     const trialExpired = team.plan_tier === 'free' && new Date(team.trial_ends_at) < new Date();

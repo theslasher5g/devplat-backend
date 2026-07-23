@@ -127,8 +127,11 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get('/auth/me', { preHandler: requireUser }, async (req) => {
+    // planTier here is the effective entitlement tier (a manual plan_override
+    // if set, else the billing plan_tier), so the dashboard reflects what the
+    // team can actually use. Billing/subscription state is under /billing.
     const membership = await maybeOne<{ team_id: string; role: string; name: string; plan_tier: string; trial_ends_at: string }>(
-      `SELECT tm.team_id, tm.role, t.name, t.plan_tier, t.trial_ends_at
+      `SELECT tm.team_id, tm.role, t.name, COALESCE(t.plan_override, t.plan_tier) AS plan_tier, t.trial_ends_at
        FROM team_members tm JOIN teams t ON t.id = tm.team_id
        WHERE tm.user_id = $1 ORDER BY tm.created_at LIMIT 1`,
       [req.user.id],

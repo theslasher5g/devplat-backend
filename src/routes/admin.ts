@@ -2,7 +2,27 @@ import type { FastifyInstance } from 'fastify';
 import { config, type PlanTier } from '../config.js';
 import { getPlan } from '../plans.js';
 import { query, withTransaction } from '../db.js';
+import { stripe } from '../lib/stripe.js';
 import { requirePlatformAdmin } from '../plugins/auth.js';
+
+/** Best-effort cancel of a team's Stripe subscription before the team row is
+ *  deleted, so removing a paying team doesn't leave it billing in Stripe.
+ *  Silent no-op when Stripe isn't configured or the team has no subscription;
+ *  a Stripe error is swallowed (logged) rather than blocking the delete — the
+ *  local record is the thing the admin asked to remove. */
+async function cancelTeamStripeSubscription(teamId: string): Promise<void> {
+  if (!stripe) return;
+  const sub = await query<{ stripe_subscription_id: string }>(
+    'SELECT stripe_subscription_id FROM subscriptions WHERE team_id = $1', [teamId],
+  );
+  const subId = sub.rows[0]?.stripe_subscription_id;
+  if (!subId) return;
+  try {
+    await stripe.subscriptions.cancel(subId);
+  } catch (err) {
+    console.error(`[admin] failed to cancel Stripe subscription ${subId} for team ${teamId}`, err);
+  }
+}
 
 /**
  * Platform-admin endpoints for the /admin dashboard. hosts/usage_events data
@@ -28,37 +48,52 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
-  app.get('/admin/subscribers', { preHandler: requirePlatformAdmin }, async () => {
+  app.get('/admin/subscribers', { preHandler: requirePlatformAdmin }, async (req) => {
+    // Optional case-insensitive search over team name OR any member's email.
+    const q = ((req.query as { q?: string }).q ?? '').trim();
+    const like = `%${q}%`;
     const res = await query<{
-      id: string; name: string; plan_tier: PlanTier; created_at: string;
-      status: string | null; current_period_end: string | null;
+      id: string; name: string; plan_tier: PlanTier; plan_override: PlanTier | null; created_at: string;
+      status: string | null; current_period_end: string | null; owner_email: string | null;
       member_count: string; vm_starts_30d: string; owner_verified: boolean | null;
     }>(
-      `SELECT t.id, t.name, t.plan_tier, t.created_at, s.status, s.current_period_end,
+      `SELECT t.id, t.name, t.plan_tier, t.plan_override, t.created_at, s.status, s.current_period_end,
               (SELECT count(*) FROM team_members tm WHERE tm.team_id = t.id) AS member_count,
               (SELECT count(*) FROM usage_events ue
                 WHERE ue.team_id = t.id AND ue.event_type = 'start'
                   AND ue.occurred_at > now() - interval '30 days') AS vm_starts_30d,
-              -- The owner's verification status: registration creates the
+              -- The owner's email + verification status: registration creates the
               -- team immediately and emails a verification link async, so an
               -- owner who never clicks it (e.g. Resend not configured, email
               -- lost) leaves a team here that looks identical to a real one
               -- unless this is surfaced.
+              (SELECT u.email FROM team_members tm JOIN users u ON u.id = tm.user_id
+                 WHERE tm.team_id = t.id AND tm.role = 'owner' LIMIT 1) AS owner_email,
               (SELECT u.email_verified_at IS NOT NULL FROM team_members tm
                  JOIN users u ON u.id = tm.user_id
                  WHERE tm.team_id = t.id AND tm.role = 'owner' LIMIT 1) AS owner_verified
        FROM teams t LEFT JOIN subscriptions s ON s.team_id = t.id
+       WHERE $1 = ''
+          OR t.name ILIKE $2
+          OR EXISTS (SELECT 1 FROM team_members tm JOIN users u ON u.id = tm.user_id
+                       WHERE tm.team_id = t.id AND u.email ILIKE $2)
        ORDER BY t.created_at DESC`,
+      [q, like],
     );
     return {
       teams: res.rows.map((t) => ({
         id: t.id,
         name: t.name,
+        // Billing plan (Stripe truth) drives MRR; plan_override is the manual
+        // entitlement grant, surfaced separately so the two aren't conflated.
         planTier: t.plan_tier,
         planLabel: getPlan(t.plan_tier).label,
+        planOverride: t.plan_override,
+        planOverrideLabel: t.plan_override ? getPlan(t.plan_override).label : null,
         mrrChf: getPlan(t.plan_tier).chfMonthly,
         subscriptionStatus: t.status,
         currentPeriodEnd: t.current_period_end,
+        ownerEmail: t.owner_email,
         members: Number(t.member_count),
         vmStarts30d: Number(t.vm_starts_30d),
         createdAt: t.created_at,
@@ -67,30 +102,114 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
-  // Cleanup for signups that never verified (e.g. Resend wasn't configured, or
-  // the owner just abandoned the flow) — refuses to touch a team whose owner
-  // has verified, so this can't be used to delete a live customer by mistake.
-  app.delete('/admin/teams/:id', { preHandler: requirePlatformAdmin }, async (req, reply) => {
+  // Set or clear a team's manual plan override. This grants (or revokes) the
+  // entitlements of a tier WITHOUT touching Stripe, the subscription, or MRR —
+  // planTier stays whatever billing says. `planOverride: null` clears it.
+  app.patch('/admin/teams/:id', {
+    preHandler: requirePlatformAdmin,
+    schema: {
+      body: {
+        type: 'object',
+        required: ['planOverride'],
+        properties: { planOverride: { type: ['string', 'null'], enum: ['free', 'solo', 'team', 'scale', null] } },
+      },
+    },
+  }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const owner = await query<{ email_verified_at: string | null }>(
-      `SELECT u.email_verified_at FROM team_members tm
-         JOIN users u ON u.id = tm.user_id
-         WHERE tm.team_id = $1 AND tm.role = 'owner' LIMIT 1`,
+    const { planOverride } = req.body as { planOverride: PlanTier | null };
+    const found = await query('UPDATE teams SET plan_override = $1 WHERE id = $2 RETURNING id', [planOverride, id]);
+    if (found.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
+    return { ok: true, planOverride, planOverrideLabel: planOverride ? getPlan(planOverride).label : null };
+  });
+
+  // All users, newest first, with their team memberships — optional ?q= search
+  // over email. Powers the admin's user list / search / delete.
+  app.get('/admin/users', { preHandler: requirePlatformAdmin }, async (req) => {
+    const q = ((req.query as { q?: string }).q ?? '').trim();
+    const like = `%${q}%`;
+    const res = await query<{
+      id: string; email: string; email_verified_at: string | null; is_platform_admin: boolean;
+      created_at: string; teams: { teamId: string; teamName: string; role: string }[] | null;
+    }>(
+      `SELECT u.id, u.email, u.email_verified_at, u.is_platform_admin, u.created_at,
+              COALESCE(
+                (SELECT json_agg(json_build_object('teamId', t.id, 'teamName', t.name, 'role', tm.role)
+                                 ORDER BY tm.created_at)
+                   FROM team_members tm JOIN teams t ON t.id = tm.team_id
+                   WHERE tm.user_id = u.id),
+                '[]'::json) AS teams
+       FROM users u
+       WHERE $1 = '' OR u.email ILIKE $2
+       ORDER BY u.created_at DESC`,
+      [q, like],
+    );
+    return {
+      users: res.rows.map((u) => ({
+        id: u.id,
+        email: u.email,
+        verified: u.email_verified_at !== null,
+        isPlatformAdmin: u.is_platform_admin,
+        createdAt: u.created_at,
+        teams: u.teams ?? [],
+      })),
+    };
+  });
+
+  // Delete a user. Deleting a platform admin (including yourself) is refused so
+  // the admin can't be locked out. Team memberships cascade; any team the user
+  // was the SOLE member of is removed too (best-effort Stripe cancel first),
+  // rather than leaving an orphaned, memberless team behind.
+  app.delete('/admin/users/:id', { preHandler: requirePlatformAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (id === req.user.id) return reply.code(400).send({ error: 'self', detail: 'You cannot delete your own account here.' });
+    const target = await query<{ is_platform_admin: boolean }>('SELECT is_platform_admin FROM users WHERE id = $1', [id]);
+    if (target.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
+    if (target.rows[0].is_platform_admin) {
+      return reply.code(400).send({ error: 'is_admin', detail: 'Refusing to delete a platform admin.' });
+    }
+    // Teams this user solely owns/occupies — they'll be memberless after the
+    // user goes, so tear them down (and cancel their Stripe sub) too.
+    const soleTeams = await query<{ team_id: string }>(
+      `SELECT tm.team_id FROM team_members tm
+       WHERE tm.user_id = $1
+         AND (SELECT count(*) FROM team_members x WHERE x.team_id = tm.team_id) = 1`,
       [id],
     );
-    if (owner.rows.length === 0) {
-      return reply.code(404).send({ error: 'not_found' });
+    for (const t of soleTeams.rows) await cancelTeamStripeSubscription(t.team_id);
+    await withTransaction(async (tx) => {
+      await tx.query('DELETE FROM users WHERE id = $1', [id]); // team_members cascade
+      if (soleTeams.rows.length > 0) {
+        await tx.query('DELETE FROM teams WHERE id = ANY($1)', [soleTeams.rows.map((t) => t.team_id)]);
+      }
+    });
+    return reply.code(204).send();
+  });
+
+  // Delete any team — verified customers included (this is deliberate; the
+  // admin asked to be able to remove any team, not only abandoned signups).
+  // Two guardrails only: the team must exist, and it must not contain a
+  // platform admin (which also stops the admin nuking their own team and
+  // locking themselves out). Any Stripe subscription is cancelled first so a
+  // deleted paying team doesn't keep getting billed.
+  app.delete('/admin/teams/:id', { preHandler: requirePlatformAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const team = await query<{ id: string }>('SELECT id FROM teams WHERE id = $1', [id]);
+    if (team.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
+    const hasAdmin = await query<{ one: number }>(
+      `SELECT 1 AS one FROM team_members tm JOIN users u ON u.id = tm.user_id
+         WHERE tm.team_id = $1 AND u.is_platform_admin LIMIT 1`,
+      [id],
+    );
+    if (hasAdmin.rowCount && hasAdmin.rowCount > 0) {
+      return reply.code(400).send({ error: 'has_admin', detail: 'Refusing to delete a team that contains a platform admin.' });
     }
-    if (owner.rows[0].email_verified_at) {
-      return reply.code(400).send({ error: 'owner_verified', detail: 'Refusing to delete a team whose owner has verified their email.' });
-    }
+    await cancelTeamStripeSubscription(id);
     await withTransaction(async (tx) => {
       const members = await tx.query<{ user_id: string }>('SELECT user_id FROM team_members WHERE team_id = $1', [id]);
       await tx.query('DELETE FROM teams WHERE id = $1', [id]);
-      // Also purge any member this team leaves as an orphaned, unverified
-      // user — otherwise their email stays "taken" forever with no way to
-      // sign up again, even though the team that email was tied to is gone.
-      // Never touches a verified user, even if this was their only team.
+      // Purge any member this leaves orphaned (no other team) AND unverified —
+      // otherwise their email stays "taken" with no team behind it. A verified
+      // user keeps their account even if this was their only team.
       const memberIds = members.rows.map((m) => m.user_id);
       if (memberIds.length > 0) {
         await tx.query(

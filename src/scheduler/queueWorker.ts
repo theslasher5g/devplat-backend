@@ -10,7 +10,7 @@ export async function processQueue(): Promise<void> {
   await reclaimStaleAssignments();
 
   const queued = await query<{ id: string; team_id: string; plan_tier: PlanTier; trial_ends_at: string }>(
-    `SELECT er.id, er.team_id, t.plan_tier, t.trial_ends_at
+    `SELECT er.id, er.team_id, COALESCE(t.plan_override, t.plan_tier) AS plan_tier, t.trial_ends_at
      FROM environment_requests er JOIN teams t ON t.id = er.team_id
      WHERE er.status = 'queued'
      ORDER BY er.requested_at ASC
