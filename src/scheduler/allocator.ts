@@ -64,10 +64,31 @@ async function candidateHosts(vcpu: number, ramMb: number): Promise<HostRow[]> {
  *  least-loaded order; a single unreachable agent doesn't fail the request,
  *  it just moves to the next candidate. Returns false if nothing changed
  *  (no capacity, or every reachable host failed) so the caller/queue worker
- *  can leave it queued. */
-export async function tryAssign(requestId: string, teamId: string, vcpu: number, ramMb: number): Promise<EnvironmentResult | null> {
+ *  can leave it queued.
+ *
+ *  `logIfNoCapacity` controls whether a "no host fits" outcome is logged.
+ *  Only the initial call from requestEnvironment() passes true — the queue
+ *  worker retries every queued row on every tick (a few seconds), so logging
+ *  there too would spam the log for as long as the request sits queued. A
+ *  request that's queued for lack of *parallelism* (not size) never reaches
+ *  here at all (see requestEnvironment/processQueue's running>=limit check),
+ *  so this only fires for the "no single host has room" case — previously
+ *  completely silent, which made a request that stays queued forever
+ *  (e.g. after a plan/plan-override change asks for a bigger per-VM size
+ *  than any host has free) impossible to diagnose from the logs. */
+export async function tryAssign(
+  requestId: string, teamId: string, vcpu: number, ramMb: number, logIfNoCapacity = false,
+): Promise<EnvironmentResult | null> {
   const hosts = await candidateHosts(vcpu, ramMb);
-  if (hosts.length === 0) return null;
+  if (hosts.length === 0) {
+    if (logIfNoCapacity) {
+      console.warn(
+        `[scheduler] no host has room for request ${requestId} (team ${teamId}, ${vcpu} vCPU / ${ramMb} MB) — ` +
+        'will retry as capacity frees up; check /admin Hosts for online status and free CPU/RAM.',
+      );
+    }
+    return null;
+  }
 
   // Claim the row before doing anything slow. createVm() boots a real VM and
   // waits for its guest dockerd to become reachable — that can take several
@@ -177,7 +198,7 @@ export async function requestEnvironment(teamId: string, tokenId: string | null 
     return { requestId: request.id, status: 'queued' };
   }
 
-  const result = await tryAssign(request.id, teamId, plan.vcpu, plan.ramMb);
+  const result = await tryAssign(request.id, teamId, plan.vcpu, plan.ramMb, true);
   if (result) return result;
 
   // Capacity existed on paper but every reachable host failed — leave it
