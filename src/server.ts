@@ -1,8 +1,6 @@
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
-import swagger from '@fastify/swagger';
-import swaggerUi from '@fastify/swagger-ui';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { config } from './config.js';
@@ -81,38 +79,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       .send({ error: clientError ? err.message : 'internal_error' });
   });
 
-  app.get('/health', { schema: { hide: true } }, async () => ({ ok: true, service: 'devplat-api' }));
-
-  // OpenAPI spec generated from each route's JSON schema, served as an
-  // interactive page at /docs and as the raw spec at /openapi.json. Registered
-  // before the routes so it collects their schemas. Routes without a schema
-  // still appear (with minimal detail); the token-authenticated public API
-  // (Environments) carries full summaries/tags.
-  await app.register(swagger, {
-    openapi: {
-      info: {
-        title: 'devplat API',
-        version: '1.0.0',
-        description: 'REST API for the devplat remote Testcontainers backend. The token-authenticated Environments endpoints are what the CLI and CI runners call; browser/session endpoints back the dashboard.',
-      },
-      servers: [{ url: config.apiUrl ?? 'https://api.devplat.ch' }],
-      components: {
-        securitySchemes: {
-          bearerToken: { type: 'http', scheme: 'bearer', description: 'A dvp_… API token created in the dashboard under API Tokens.' },
-          sessionCookie: { type: 'apiKey', in: 'cookie', name: 'devplat_session', description: 'Set by browser sign-in; backs the dashboard.' },
-        },
-      },
-      tags: [
-        { name: 'Environments', description: 'Request, inspect, and release remote microVM environments (token-authenticated).' },
-      ],
-    },
-  });
-  await app.register(swaggerUi, {
-    routePrefix: '/docs',
-    uiConfig: { docExpansion: 'list', deepLinking: true },
-  });
-  // Convenience alias for the raw spec (swagger-ui also serves it at /docs/json).
-  app.get('/openapi.json', { schema: { hide: true } }, async () => app.swagger());
+  app.get('/health', async () => ({ ok: true, service: 'devplat-api' }));
 
   await app.register(authRoutes);
   await app.register(deviceAuthRoutes);
