@@ -31,6 +31,11 @@ export const config = {
   emailFrom: process.env.EMAIL_FROM ?? 'devplat <noreply@devplat.ch>',
   // Where "Book a call" / contact-form submissions are sent as a notification.
   contactEmail: process.env.CONTACT_EMAIL ?? 'hello@devplat.ch',
+  // Ops alerting: where infrastructure alerts (e.g. a host going offline) are
+  // sent. Defaults to the contact inbox; a Slack incoming-webhook URL, when
+  // set, gets the same alert. Both channels are best-effort.
+  opsAlertEmail: process.env.OPS_ALERT_EMAIL ?? process.env.CONTACT_EMAIL ?? 'hello@devplat.ch',
+  slackAlertWebhookUrl: process.env.SLACK_ALERT_WEBHOOK_URL ?? '',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? '',
   stripePrices: {

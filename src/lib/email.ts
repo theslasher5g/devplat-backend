@@ -3,6 +3,7 @@ import { Resend } from 'resend';
 import type { ReactElement } from 'react';
 import { config } from '../config.js';
 import ContactSubmission from '../emails/ContactSubmission.js';
+import HostOfflineAlert from '../emails/HostOfflineAlert.js';
 import ResetPassword from '../emails/ResetPassword.js';
 import StatusConfirm from '../emails/StatusConfirm.js';
 import StatusNotify from '../emails/StatusNotify.js';
@@ -54,6 +55,17 @@ export async function sendStatusNotifyEmail(
   const unsubscribeUrl = `${config.frontendUrl}/status/unsubscribe?token=${payload.unsubscribeToken}`;
   await send(to, `[devplat status] ${payload.title}`,
     StatusNotify({ kicker: payload.kicker, title: payload.title, body: payload.body, statusUrl, unsubscribeUrl }));
+}
+
+/** Emails the ops inbox that a host dropped out of rotation. Best-effort — the
+ *  caller has already logged the transition, so a Resend outage here just loses
+ *  the notification. */
+export async function sendHostOfflineEmail(payload: {
+  hostName: string; location: string; lastHeartbeat: string;
+}): Promise<void> {
+  const dashboardUrl = `${config.frontendUrl}/admin`;
+  await send(config.opsAlertEmail, `[devplat ops] Host ${payload.hostName} offline`,
+    HostOfflineAlert({ ...payload, dashboardUrl }));
 }
 
 /** Notifies the contact inbox of a new "Book a call" / contact-form submission.

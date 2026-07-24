@@ -57,6 +57,56 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
+  // Full drill-down for one host: its capacity/utilization plus the
+  // environments currently placed on it and the most recent failed starts that
+  // named it — enough to diagnose "why is this host unhealthy" from the admin UI.
+  app.get('/admin/hosts/:id/detail', { preHandler: requirePlatformAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const host = await query<{
+      id: string; name: string; location: string; cpu_total: number; ram_total_mb: number;
+      cpu_used: number; ram_used_mb: number; status: string; drain: boolean;
+      last_heartbeat: string | null; offline_alerted_at: string | null;
+      cache_lookups: string | null; cache_hits: string | null;
+    }>(
+      'SELECT id, name, location, cpu_total, ram_total_mb, cpu_used, ram_used_mb, status, drain, last_heartbeat, offline_alerted_at, cache_lookups, cache_hits FROM hosts WHERE id = $1',
+      [id],
+    );
+    if (host.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
+    const h = host.rows[0];
+    const [envs, failures] = await Promise.all([
+      query<{ id: string; team_name: string; vm_id: string | null; status: string; assigned_at: string | null; vcpu: number | null; ram_mb: number | null }>(
+        `SELECT er.id, t.name AS team_name, er.vm_id, er.status, er.assigned_at, er.vcpu, er.ram_mb
+         FROM environment_requests er JOIN teams t ON t.id = er.team_id
+         WHERE er.host_id = $1 AND er.status = 'assigned' ORDER BY er.assigned_at DESC NULLS LAST`,
+        [id],
+      ),
+      query<{ id: string; team_name: string; error: string | null; attempts: number; requested_at: string }>(
+        `SELECT er.id, t.name AS team_name, er.error, er.attempts, er.requested_at
+         FROM environment_requests er JOIN teams t ON t.id = er.team_id
+         WHERE er.host_id = $1 AND er.status = 'failed' ORDER BY er.requested_at DESC LIMIT 8`,
+        [id],
+      ),
+    ]);
+    const lookups = h.cache_lookups === null ? null : Number(h.cache_lookups);
+    const hits = h.cache_hits === null ? null : Number(h.cache_hits);
+    return {
+      host: {
+        id: h.id, name: h.name, location: h.location, status: h.status, drain: h.drain,
+        lastHeartbeat: h.last_heartbeat, offlineAlertedAt: h.offline_alerted_at,
+        cpu: { total: h.cpu_total, used: h.cpu_used },
+        ramMb: { total: h.ram_total_mb, used: h.ram_used_mb },
+        cacheHitRate: lookups && lookups > 0 && hits !== null ? hits / lookups : null,
+      },
+      environments: envs.rows.map((e) => ({
+        id: e.id, teamName: e.team_name, vmId: e.vm_id, status: e.status,
+        assignedAt: e.assigned_at, vcpu: e.vcpu, ramMb: e.ram_mb,
+      })),
+      recentFailures: failures.rows.map((f) => ({
+        id: f.id, teamName: f.team_name, error: f.error, attempts: f.attempts, occurredAt: f.requested_at,
+      })),
+    };
+  });
+
   app.get('/admin/subscribers', { preHandler: requirePlatformAdmin }, async (req) => {
     // Optional case-insensitive search over team name OR any member's email.
     const q = ((req.query as { q?: string }).q ?? '').trim();
