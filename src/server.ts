@@ -5,6 +5,7 @@ import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { config } from './config.js';
 import { query } from './db.js';
+import { getLatestCliVersion } from './lib/cliVersion.js';
 import adminRoutes from './routes/admin.js';
 import authRoutes from './routes/auth.js';
 import deviceAuthRoutes from './routes/deviceAuth.js';
@@ -107,6 +108,16 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   // Liveness: the process is up. Cheap, no dependencies — for load balancers.
   app.get('/health', async () => ({ ok: true, service: 'devplat-api' }));
+
+  // Latest CLI release, proxied (and cached) from the release host so the
+  // browser can read it same-origin — get.devplat.ch/version.txt itself sends
+  // no CORS headers. Public: it's just a version string.
+  app.get('/cli/latest-version', async (_req, reply) => {
+    const version = await getLatestCliVersion();
+    // Let intermediaries cache briefly; the value changes only on release.
+    reply.header('cache-control', 'public, max-age=300');
+    return { version };
+  });
 
   // Readiness: can we actually serve? Checks DB connectivity and reports
   // operational signals (online hosts, queue depth) so monitoring can alert on
