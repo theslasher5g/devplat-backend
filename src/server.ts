@@ -21,6 +21,25 @@ import { loadPlans } from './plans.js';
 import { startHealthPoller } from './scheduler/healthPoller.js';
 import { startQueueWorker } from './scheduler/queueWorker.js';
 
+/** The set of browser origins allowed to call the API with credentials: the
+ *  configured frontend URL, its apex↔www counterpart, and the local dev origin.
+ *  Deriving the counterpart means a deploy served at both devplat.ch and
+ *  www.devplat.ch works without listing each by hand. */
+function allowedOrigins(frontendUrl: string): string[] {
+  const origins = new Set<string>(['http://localhost:5173']);
+  try {
+    const u = new URL(frontendUrl);
+    origins.add(u.origin);
+    // Add the www↔apex sibling of the configured host.
+    const host = u.hostname.startsWith('www.') ? u.hostname.slice(4) : `www.${u.hostname}`;
+    origins.add(`${u.protocol}//${host}`);
+  } catch {
+    // Malformed FRONTEND_URL — fall back to just the raw string + localhost.
+    origins.add(frontendUrl);
+  }
+  return [...origins];
+}
+
 export async function buildServer(): Promise<FastifyInstance> {
   // Plan/tier data lives in the DB (plans table); load it into the typed
   // cache before any route or scheduler loop reads it. migrate() has already
@@ -33,7 +52,13 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   await app.register(cors, {
-    origin: [config.frontendUrl, 'http://localhost:5173'],
+    // Allow the configured frontend origin AND its apex/www counterpart: the
+    // site is reachable at both https://devplat.ch and https://www.devplat.ch,
+    // and a browser on the "wrong" one would otherwise have every API call
+    // blocked by CORS ("API not reachable"). Cookies already span the parent
+    // domain (sessionCookieOptions' domain = .devplat.ch), so accepting both
+    // origins is all that's needed for login to work from either host.
+    origin: allowedOrigins(config.frontendUrl),
     credentials: true,
     // @fastify/cors defaults `methods` to 'GET,HEAD,POST' — DELETE and PATCH
     // (token/member/host revocation, team rename, environment release, ...)
