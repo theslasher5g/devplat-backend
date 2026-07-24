@@ -43,7 +43,30 @@ export const config = {
     team: { monthly: process.env.STRIPE_PRICE_TEAM_MONTHLY ?? '', yearly: process.env.STRIPE_PRICE_TEAM_YEARLY ?? '' },
     scale: { monthly: process.env.STRIPE_PRICE_SCALE_MONTHLY ?? '', yearly: process.env.STRIPE_PRICE_SCALE_YEARLY ?? '' },
   } as Record<Exclude<PlanTier, 'free'>, { monthly: string; yearly: string }>,
+  // Optional seasonal discount campaign (e.g. "15% off in August"). Point
+  // PROMO_COUPON_ID at a Stripe coupon you created once; while now < PROMO_ENDS_AT
+  // it's applied automatically at checkout (no code to type) and advertised via
+  // GET /promo. Leave PROMO_COUPON_ID empty to disable — checkout then falls
+  // back to accepting a manually-entered promotion code instead.
+  promo: {
+    couponId: process.env.PROMO_COUPON_ID ?? '',
+    label: process.env.PROMO_LABEL ?? '',
+    code: process.env.PROMO_CODE ?? '',
+    endsAt: process.env.PROMO_ENDS_AT ?? '',
+  },
 };
+
+/** The seasonal promo, if one is configured and still within its window.
+ *  Returns null when disabled or expired, so callers can branch cleanly. */
+export function activePromo(): { couponId: string; label: string; code: string; endsAt: string } | null {
+  const p = config.promo;
+  if (!p.couponId) return null;
+  if (p.endsAt) {
+    const end = Date.parse(p.endsAt);
+    if (Number.isFinite(end) && Date.now() > end) return null;
+  }
+  return { couponId: p.couponId, label: p.label, code: p.code, endsAt: p.endsAt };
+}
 
 /** Reverse lookup: which tier/interval does a Stripe price id belong to? */
 export function tierForPrice(priceId: string): { tier: Exclude<PlanTier, 'free'>; interval: 'monthly' | 'yearly' } | null {

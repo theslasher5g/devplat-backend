@@ -1,11 +1,20 @@
 import type { FastifyInstance } from 'fastify';
-import { config, type PlanTier } from '../config.js';
+import { activePromo, config, type PlanTier } from '../config.js';
 import { maybeOne, one } from '../db.js';
 import { getPlan, maxFootprintGb } from '../plans.js';
 import { ensureStripeCustomer, requireStripe } from '../lib/stripe.js';
 import { requireTeamAdmin } from '../plugins/auth.js';
 
 export default async function billingRoutes(app: FastifyInstance): Promise<void> {
+  // Public: the active seasonal promo, for the marketing promo banner. Returns
+  // { active: false } when none is running.
+  app.get('/promo', async () => {
+    const promo = activePromo();
+    return promo
+      ? { active: true, label: promo.label, code: promo.code, endsAt: promo.endsAt || null }
+      : { active: false };
+  });
+
   // Current plan + subscription state for the dashboard's billing view.
   app.get('/billing/subscription', { preHandler: requireTeamAdmin }, async (req) => {
     const team = await one<{ plan_tier: PlanTier; trial_ends_at: string; stripe_customer_id: string | null }>(
@@ -51,6 +60,11 @@ export default async function billingRoutes(app: FastifyInstance): Promise<void>
     if (!priceId) return reply.code(500).send({ error: 'price_not_configured', detail: `${tier}/${interval}` });
 
     const customerId = await ensureStripeCustomer(req.membership.teamId, req.user.email);
+    // A live campaign auto-applies its coupon (no code to type). Stripe Checkout
+    // forbids `discounts` and `allow_promotion_codes` together, so it's one or
+    // the other: auto-apply when a campaign is running, otherwise let the
+    // customer enter a promotion code by hand.
+    const promo = activePromo();
     const session = await requireStripe().checkout.sessions.create({
       mode: 'subscription',
       customer: customerId,
@@ -59,7 +73,9 @@ export default async function billingRoutes(app: FastifyInstance): Promise<void>
       cancel_url: `${config.frontendUrl}/app/billing?checkout=cancelled`,
       client_reference_id: req.membership.teamId,
       subscription_data: { metadata: { team_id: req.membership.teamId } },
-      allow_promotion_codes: true,
+      ...(promo
+        ? { discounts: [{ coupon: promo.couponId }] }
+        : { allow_promotion_codes: true }),
     });
     return { url: session.url };
   });
