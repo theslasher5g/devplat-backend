@@ -34,14 +34,22 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get('/admin/hosts', { preHandler: requirePlatformAdmin }, async () => {
     const res = await query<{
       id: string; name: string; location: string; cpu_total: number; ram_total_mb: number;
-      cpu_used: number; ram_used_mb: number; status: string; last_heartbeat: string | null;
-    }>('SELECT * FROM hosts ORDER BY name');
+      cpu_used: number; ram_used_mb: number; status: string; drain: boolean; last_heartbeat: string | null;
+      vms: string;
+    }>(
+      `SELECT h.*,
+              (SELECT count(*) FROM environment_requests er
+                 WHERE er.host_id = h.id AND er.status = 'assigned') AS vms
+       FROM hosts h ORDER BY h.name`,
+    );
     return {
       hosts: res.rows.map((h) => ({
         id: h.id,
         name: h.name,
         location: h.location,
         status: h.status,
+        drain: h.drain,
+        vms: Number(h.vms),
         lastHeartbeat: h.last_heartbeat,
         cpu: { total: h.cpu_total, used: h.cpu_used },
         ramMb: { total: h.ram_total_mb, used: h.ram_used_mb },

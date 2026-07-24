@@ -56,11 +56,13 @@ export async function effectivePlan(teamId: string): Promise<EffectivePlan> {
   return { parallelEnvs: trialExpired ? 0 : plan.parallelEnvs, vcpu: plan.vcpuPerEnv, ramMb: plan.ramMbPerEnv };
 }
 
-/** Hosts that can fit a VM of the given size, most-free-CPU first. */
+/** Hosts that can fit a VM of the given size, most-free-CPU first. Excludes
+ *  hosts an admin has marked to drain (they keep their existing VMs but take
+ *  no new ones). */
 async function candidateHosts(vcpu: number, ramMb: number): Promise<HostRow[]> {
   const res = await query<HostRow>(
     `SELECT id, name, agent_endpoint, agent_token, cpu_total, cpu_used, ram_total_mb, ram_used_mb, status
-     FROM hosts WHERE status = 'online' AND agent_endpoint IS NOT NULL AND agent_token IS NOT NULL`,
+     FROM hosts WHERE status = 'online' AND drain = false AND agent_endpoint IS NOT NULL AND agent_token IS NOT NULL`,
   );
   return res.rows
     .filter((h) => hostFits(h, vcpu, ramMb))

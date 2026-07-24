@@ -4,6 +4,7 @@ import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { config } from './config.js';
+import { query } from './db.js';
 import adminRoutes from './routes/admin.js';
 import authRoutes from './routes/auth.js';
 import deviceAuthRoutes from './routes/deviceAuth.js';
@@ -79,7 +80,40 @@ export async function buildServer(): Promise<FastifyInstance> {
       .send({ error: clientError ? err.message : 'internal_error' });
   });
 
+  // Liveness: the process is up. Cheap, no dependencies — for load balancers.
   app.get('/health', async () => ({ ok: true, service: 'devplat-api' }));
+
+  // Readiness: can we actually serve? Checks DB connectivity and reports
+  // operational signals (online hosts, queue depth) so monitoring can alert on
+  // "up but can't place VMs". 503 when the DB is unreachable.
+  app.get('/ready', async (req, reply) => {
+    try {
+      const [hosts, queue] = await Promise.all([
+        query<{ online: string; draining: string }>(
+          `SELECT count(*) FILTER (WHERE status = 'online' AND drain = false) AS online,
+                  count(*) FILTER (WHERE drain = true) AS draining
+           FROM hosts WHERE last_heartbeat > now() - ($1 || ' seconds')::interval`,
+          [String(config.agentHeartbeatTimeoutSeconds)],
+        ),
+        query<{ queued: string }>(
+          "SELECT count(*) AS queued FROM environment_requests WHERE status IN ('queued', 'assigning')",
+        ),
+      ]);
+      const onlineHosts = Number(hosts.rows[0].online);
+      return {
+        ready: true,
+        db: true,
+        onlineHosts,
+        drainingHosts: Number(hosts.rows[0].draining),
+        queuedEnvironments: Number(queue.rows[0].queued),
+        // A healthy API with zero usable hosts can't place any VM — surface it.
+        canPlaceEnvironments: onlineHosts > 0,
+      };
+    } catch (err) {
+      req.log.warn({ err }, 'readiness check failed');
+      return reply.code(503).send({ ready: false, db: false });
+    }
+  });
 
   await app.register(authRoutes);
   await app.register(deviceAuthRoutes);

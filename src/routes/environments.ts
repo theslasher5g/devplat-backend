@@ -7,6 +7,32 @@ function teamIdOf(req: { apiTokenTeamId?: string; membership?: { teamId: string 
   return req.apiTokenTeamId ?? req.membership!.teamId;
 }
 
+/** Tiny in-memory fixed-window rate limiter, keyed by team. Single-process, so
+ *  a Map is enough (same assumption the global limiter's default store makes).
+ *  Stale windows are pruned lazily on access, so the map can't grow unbounded. */
+const teamRateLimiter = (() => {
+  const MAX = 60; // requests
+  const WINDOW_MS = 60_000; // per minute
+  const buckets = new Map<string, { count: number; resetAt: number }>();
+  return {
+    allow(teamId: string): boolean {
+      const now = Date.now();
+      const b = buckets.get(teamId);
+      if (!b || b.resetAt <= now) {
+        buckets.set(teamId, { count: 1, resetAt: now + WINDOW_MS });
+        // Opportunistic prune so the map tracks only active teams.
+        if (buckets.size > 1000) {
+          for (const [k, v] of buckets) if (v.resetAt <= now) buckets.delete(k);
+        }
+        return true;
+      }
+      if (b.count >= MAX) return false;
+      b.count++;
+      return true;
+    },
+  };
+})();
+
 /**
  * Environment (microVM) lifecycle for CI/local runs — this is the endpoint
  * the not-yet-built client CLI (build step 3) will call with a `dvp_ci_…`
@@ -17,6 +43,16 @@ function teamIdOf(req: { apiTokenTeamId?: string; membership?: { teamId: string 
 export default async function environmentRoutes(app: FastifyInstance): Promise<void> {
   app.post('/environments', { preHandler: requireApiTokenOrUser }, async (req, reply) => {
     const teamId = teamIdOf(req);
+    // Per-team request-rate limit, in addition to the global per-IP one: a
+    // single team shouldn't hammer the scheduler (piling up queued rows)
+    // regardless of how many IPs/tokens it spreads requests across. The
+    // plugin's keyGenerator runs before auth, so the team id isn't known there
+    // — hence this small in-handler fixed-window limiter, keyed on the team
+    // resolved by the preHandler above. Generous enough that a busy CI fleet
+    // never trips it; it only catches a runaway loop.
+    if (!teamRateLimiter.allow(teamId)) {
+      return reply.code(429).send({ error: 'rate_limited', detail: 'Too many environment requests — slow down and retry shortly.' });
+    }
     const result = await requestEnvironment(teamId, req.apiTokenId ?? null);
     return reply.code(result.status === 'failed' ? 502 : 202).send(result);
   });

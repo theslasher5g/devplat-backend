@@ -60,18 +60,20 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
           location: { type: 'string', maxLength: 100 },
           cpuTotal: { type: 'integer', minimum: 1 },
           ramTotalMb: { type: 'integer', minimum: 1 },
+          drain: { type: 'boolean' },
         },
       },
     },
   }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const body = req.body as { name?: string; location?: string; cpuTotal?: number; ramTotalMb?: number };
+    const body = req.body as { name?: string; location?: string; cpuTotal?: number; ramTotalMb?: number; drain?: boolean };
     const fields: string[] = [];
     const values: unknown[] = [];
     if (body.name !== undefined) { fields.push(`name = $${fields.length + 1}`); values.push(body.name); }
     if (body.location !== undefined) { fields.push(`location = $${fields.length + 1}`); values.push(body.location); }
     if (body.cpuTotal !== undefined) { fields.push(`cpu_total = $${fields.length + 1}`); values.push(body.cpuTotal); }
     if (body.ramTotalMb !== undefined) { fields.push(`ram_total_mb = $${fields.length + 1}`); values.push(body.ramTotalMb); }
+    if (body.drain !== undefined) { fields.push(`drain = $${fields.length + 1}`); values.push(body.drain); }
     if (fields.length === 0) return reply.code(400).send({ error: 'no_fields' });
     values.push(id);
     const found = await maybeOne(`UPDATE hosts SET ${fields.join(', ')} WHERE id = $${fields.length + 1} RETURNING id`, values);
