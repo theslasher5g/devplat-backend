@@ -113,6 +113,58 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
 
   // Set or clear a team's manual plan override. This grants (or revokes) the
   // entitlements of a tier WITHOUT touching Stripe, the subscription, or MRR —
+  // Full detail for one team — members, tokens, recent runs, and its audit
+  // trail — so support can see everything about a team in one place.
+  app.get('/admin/teams/:id/detail', { preHandler: requirePlatformAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const team = await query<{
+      id: string; name: string; plan_tier: PlanTier; plan_override: PlanTier | null;
+      trial_ends_at: string; created_at: string; sub_status: string | null; period_end: string | null;
+    }>(
+      `SELECT t.id, t.name, t.plan_tier, t.plan_override, t.trial_ends_at, t.created_at,
+              s.status AS sub_status, s.current_period_end AS period_end
+       FROM teams t LEFT JOIN subscriptions s ON s.team_id = t.id WHERE t.id = $1`,
+      [id],
+    );
+    if (team.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
+    const t = team.rows[0];
+    const [members, tokens, runs, audit] = await Promise.all([
+      query<{ email: string; role: string; verified: boolean; joined: string }>(
+        `SELECT u.email, tm.role, u.email_verified_at IS NOT NULL AS verified, tm.created_at AS joined
+         FROM team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id = $1 ORDER BY tm.created_at`,
+        [id],
+      ),
+      query<{ label: string; prefix: string; scope: string; last_used: string | null; revoked: boolean }>(
+        `SELECT label, token_prefix AS prefix, scope, last_used_at AS last_used, revoked_at IS NOT NULL AS revoked
+         FROM api_tokens WHERE team_id = $1 ORDER BY created_at DESC LIMIT 20`,
+        [id],
+      ),
+      query<{ id: string; status: string; vm_id: string | null; error: string | null; requested_at: string; host_name: string | null }>(
+        `SELECT er.id, er.status, er.vm_id, er.error, er.requested_at, h.name AS host_name
+         FROM environment_requests er LEFT JOIN hosts h ON h.id = er.host_id
+         WHERE er.team_id = $1 ORDER BY er.requested_at DESC LIMIT 10`,
+        [id],
+      ),
+      query<AuditRow>(
+        `SELECT id, action, target, actor_email, detail, created_at, team_id
+         FROM audit_log WHERE team_id = $1 ORDER BY created_at DESC LIMIT 15`,
+        [id],
+      ),
+    ]);
+    return {
+      team: {
+        id: t.id, name: t.name, planTier: t.plan_tier, planLabel: getPlan(t.plan_tier).label,
+        planOverride: t.plan_override, planOverrideLabel: t.plan_override ? getPlan(t.plan_override).label : null,
+        trialEndsAt: t.trial_ends_at, createdAt: t.created_at,
+        subscriptionStatus: t.sub_status, currentPeriodEnd: t.period_end,
+      },
+      members: members.rows.map((m) => ({ email: m.email, role: m.role, verified: m.verified, joinedAt: m.joined })),
+      tokens: tokens.rows.map((k) => ({ label: k.label, prefix: k.prefix, scope: k.scope, lastUsedAt: k.last_used, revoked: k.revoked })),
+      runs: runs.rows.map((r) => ({ id: r.id, status: r.status, vmId: r.vm_id, error: r.error, requestedAt: r.requested_at, hostName: r.host_name })),
+      audit: audit.rows.map(serializeAudit),
+    };
+  });
+
   // planTier stays whatever billing says. `planOverride: null` clears it.
   app.patch('/admin/teams/:id', {
     preHandler: requirePlatformAdmin,
@@ -329,11 +381,16 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
                    WHERE tm.team_id = t.id AND tm.role = 'owner' LIMIT 1) AS owner_verified
          FROM teams t ORDER BY t.created_at DESC LIMIT 8`,
       ),
-      query<{ id: string; team_name: string; vm_id: string | null; occurred_at: string }>(
-        `SELECT ue.id, t.name AS team_name, ue.vm_id, ue.occurred_at
-         FROM usage_events ue JOIN teams t ON t.id = ue.team_id
-         WHERE ue.event_type = 'start_failed'
-         ORDER BY ue.occurred_at DESC LIMIT 8`,
+      // Drill-down: recent terminally-failed requests carry the actual reason
+      // (error) and the host that last failed them, which usage_events don't —
+      // far more useful than a bare "a start failed".
+      query<{ id: string; team_name: string; error: string | null; host_name: string | null; attempts: number; requested_at: string }>(
+        `SELECT er.id, t.name AS team_name, er.error, h.name AS host_name, er.attempts, er.requested_at
+         FROM environment_requests er
+         JOIN teams t ON t.id = er.team_id
+         LEFT JOIN hosts h ON h.id = er.host_id
+         WHERE er.status = 'failed'
+         ORDER BY er.requested_at DESC LIMIT 12`,
       ),
     ]);
     return {
@@ -342,7 +399,8 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         ownerEmail: s.owner_email, ownerVerified: s.owner_verified ?? false, createdAt: s.created_at,
       })),
       recentFailures: failures.rows.map((f) => ({
-        id: f.id, teamName: f.team_name, vmId: f.vm_id, occurredAt: f.occurred_at,
+        id: f.id, teamName: f.team_name, error: f.error, hostName: f.host_name,
+        attempts: f.attempts, occurredAt: f.requested_at,
       })),
     };
   });
