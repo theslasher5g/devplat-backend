@@ -268,13 +268,19 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     // Pooled image-cache hit rate: sum hits / sum lookups across all hosts
     // that have reported cache counters (NULL for hosts whose registry debug
     // endpoint is off). Null when no host has reported any lookups yet.
-    const cache = await query<{ lookups: string | null; hits: string | null }>(
-      'SELECT sum(cache_lookups) AS lookups, sum(cache_hits) AS hits FROM hosts WHERE cache_lookups IS NOT NULL',
+    // reporting = hosts that actually publish cache counters (registry debug
+    // endpoint on + agent scraping it); surfaced so "—" can be diagnosed as
+    // "no host reporting" vs. "reporting, but nothing pulled yet".
+    const cache = await query<{ lookups: string | null; hits: string | null; reporting: string }>(
+      `SELECT sum(cache_lookups) AS lookups, sum(cache_hits) AS hits,
+              count(*) FILTER (WHERE cache_lookups IS NOT NULL) AS reporting
+       FROM hosts`,
     );
     const startCount = Number(starts.rows[0].count);
     const failCount = Number(failures.rows[0].count);
     const cacheLookups = Number(cache.rows[0].lookups ?? 0);
     const cacheHits = Number(cache.rows[0].hits ?? 0);
+    const cacheReportingHosts = Number(cache.rows[0].reporting);
     // MRR split by tier, so the number isn't just one opaque total.
     const mrrByTier = mrr.rows
       .map((r) => {
@@ -297,6 +303,8 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       // Real pooled cache hit rate from the hosts' registry proxies; null
       // until at least one host reports lookups.
       cacheHitRate: cacheLookups > 0 ? cacheHits / cacheLookups : null,
+      cacheReportingHosts,
+      cacheLookups,
       dataPlaneConnected: Number(connected.rows[0].count) > 0,
     };
   });
