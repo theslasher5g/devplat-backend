@@ -1,0 +1,13 @@
+-- Bound assignment retries so a request that can't be placed doesn't retry
+-- (and record a start_failed) forever, once every scheduler tick.
+--
+-- Before this, tryAssign() recorded a usage_events('start_failed') for every
+-- candidate host that failed createVm, on EVERY queue-worker retry (every 5s).
+-- A single un-startable VM therefore produced thousands of "failed" events,
+-- wrecking the dashboard's start-error stats (e.g. "54 starts · 9972 failed").
+--
+-- Now each failed placement increments attempts; after a cap the request is
+-- marked terminally 'failed' with exactly ONE start_failed recorded. Requests
+-- merely waiting for capacity (no host fits yet) never increment this and keep
+-- waiting as before.
+ALTER TABLE environment_requests ADD COLUMN attempts integer NOT NULL DEFAULT 0;

@@ -19,6 +19,13 @@ export interface EnvironmentResult {
 
 export const DEFAULT_TTL_MINUTES = 60;
 
+// How many times to retry placing a request whose candidate hosts all failed
+// createVm before giving up and marking it terminally failed. At the 5s queue
+// tick this is ~25s of trying — long enough to ride out a brief agent blip,
+// short enough that a genuinely un-startable request fails fast (and records a
+// single failure) instead of retrying forever.
+const MAX_ASSIGN_ATTEMPTS = 5;
+
 /** Requests currently occupying a slot for a team — matches the assigned rows
  *  1:1 with a running usage_events(start) that has no usage_events(stop) yet. */
 async function runningCount(teamId: string): Promise<number> {
@@ -107,6 +114,7 @@ export async function tryAssign(
   );
   if (!claimed) return null; // already claimed by a concurrent attempt
 
+  let lastError = '';
   for (const host of hosts) {
     const client = clientForHost(host);
     if (!client) continue;
@@ -153,18 +161,33 @@ export async function tryAssign(
       // host that's unreachable, so surface the real cause explicitly.
       const cause = err instanceof AgentError ? err.cause : undefined;
       const rootCause = cause instanceof Error && cause.cause instanceof Error ? cause.cause.message : undefined;
-      await query(
-        `INSERT INTO usage_events (team_id, host_id, event_type) VALUES ($1, $2, 'start_failed')`,
-        [teamId, host.id],
-      );
+      lastError = `${message}${rootCause ? ` (${rootCause})` : ''}`;
       // eslint-disable-next-line no-console
-      console.warn(`[scheduler] createVm failed on host ${host.name}: ${message}${rootCause ? ` (${rootCause})` : ''}`);
-      // fall through to the next candidate host
+      console.warn(`[scheduler] createVm failed on host ${host.name}: ${lastError}`);
+      // fall through to the next candidate host. NOTE: no start_failed event
+      // is recorded per-host/per-attempt anymore — that's what caused a single
+      // un-startable VM to log thousands of failures across retries. Failure is
+      // recorded exactly once, below, only when we finally give up.
     }
   }
-  // Every reachable host failed — release the claim so the queue worker
-  // picks this row up again on a later tick instead of it being stuck in
-  // 'assigning' forever.
+
+  // Every reachable candidate host failed to create a VM this round. Count the
+  // attempt; keep retrying (re-queue) up to a cap, then fail the request
+  // terminally and record ONE start_failed for the stats.
+  const bumped = await one<{ attempts: number }>(
+    "UPDATE environment_requests SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts",
+    [requestId],
+  );
+  if (bumped.attempts >= MAX_ASSIGN_ATTEMPTS) {
+    const error = `could not start a VM after ${bumped.attempts} attempts${lastError ? `: ${lastError}` : ''}`;
+    await query(
+      "UPDATE environment_requests SET status = 'failed', error = $2 WHERE id = $1 AND status = 'assigning'",
+      [requestId, error],
+    );
+    await query("INSERT INTO usage_events (team_id, event_type) VALUES ($1, 'start_failed')", [teamId]);
+    return { requestId, status: 'failed', error };
+  }
+  // Not given up yet — release the claim so the queue worker retries it.
   await query("UPDATE environment_requests SET status = 'queued' WHERE id = $1 AND status = 'assigning'", [requestId]);
   return null;
 }
