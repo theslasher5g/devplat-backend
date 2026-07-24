@@ -11,9 +11,9 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
     const [res, runs] = await Promise.all([
       query<{
         id: string; label: string; token_prefix: string; scope: string;
-        created_at: string; last_used_at: string | null;
+        created_at: string; last_used_at: string | null; last_cli_version: string | null;
       }>(
-        `SELECT id, label, token_prefix, scope, created_at, last_used_at
+        `SELECT id, label, token_prefix, scope, created_at, last_used_at, last_cli_version
          FROM api_tokens WHERE team_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC`,
         [teamId],
       ),
@@ -51,6 +51,7 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
           scope: t.scope,
           createdAt: t.created_at,
           lastUsedAt: t.last_used_at,
+          lastCliVersion: t.last_cli_version,
           usage, // 14 daily run counts, oldest→newest
           runsTotal: usage.reduce((a, b) => a + b, 0),
         };

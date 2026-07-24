@@ -52,6 +52,15 @@ function bearerToken(req: FastifyRequest): string | null {
   return null;
 }
 
+/** Accept only a bare semver (optionally v-prefixed) from the client-supplied
+ *  version header and normalise it to the `vX.Y.Z` form the release paths use.
+ *  Anything else — absent, `dev`, or malformed — yields null so it's ignored. */
+function normalizeCliVersion(raw: string | string[] | undefined): string | null {
+  const value = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+  if (!value || !/^v?\d+\.\d+\.\d+$/.test(value)) return null;
+  return value.startsWith('v') ? value : `v${value}`;
+}
+
 async function loadUser(userId: string): Promise<SessionUser | null> {
   const row = await maybeOne<{
     id: string; email: string; email_verified_at: string | null; is_platform_admin: boolean;
@@ -134,7 +143,15 @@ export async function requireApiTokenOrUser(req: FastifyRequest, reply: FastifyR
       reply.code(401).send({ error: 'invalid_api_token' });
       return reply;
     }
-    await query('UPDATE api_tokens SET last_used_at = now() WHERE id = $1', [row.id]);
+    // Opportunistically record the CLI version the caller advertises, alongside
+    // the last-used stamp we already write. Validated to a bare (optionally
+    // v-prefixed) semver and capped so a hostile client can't store junk; a
+    // missing/`dev`/malformed header just leaves the column unchanged.
+    const cliVersion = normalizeCliVersion(req.headers['x-devplat-cli-version']);
+    await query(
+      'UPDATE api_tokens SET last_used_at = now(), last_cli_version = COALESCE($2, last_cli_version) WHERE id = $1',
+      [row.id, cliVersion],
+    );
     req.apiTokenTeamId = row.team_id;
     req.apiTokenId = row.id;
     return;
