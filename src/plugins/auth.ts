@@ -31,8 +31,44 @@ declare module 'fastify' {
   }
 }
 
-export function signSession(userId: string): string {
-  return jwt.sign({ sub: userId }, config.jwtSecret, { expiresIn: '7d' });
+/**
+ * Sign a session JWT. When `sessionId` is given the token carries it as `sid`,
+ * tying the JWT to a row in user_sessions so it can be listed and revoked
+ * individually. Tokens without a `sid` (issued before session tracking) stay
+ * valid until they expire — they just can't be revoked one at a time.
+ */
+export function signSession(userId: string, sessionId?: string): string {
+  return jwt.sign(
+    sessionId ? { sub: userId, sid: sessionId } : { sub: userId },
+    config.jwtSecret,
+    { expiresIn: '7d' },
+  );
+}
+
+/** Records a new session and returns its id, for embedding in the JWT. */
+export async function createSession(
+  userId: string,
+  req: { headers: Record<string, unknown>; ip?: string },
+): Promise<string> {
+  const ua = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 400) : null;
+  const row = await query<{ id: string }>(
+    'INSERT INTO user_sessions (user_id, user_agent, ip) VALUES ($1, $2, $3) RETURNING id',
+    [userId, ua, req.ip ?? null],
+  );
+  return row.rows[0].id;
+}
+
+/**
+ * Issue a session for `userId` and set the cookie on `reply`. Used everywhere a
+ * session is (re-)established: login, and the credential changes that revoke
+ * all sessions and must hand the acting caller a fresh one.
+ */
+export async function establishSession(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  const sid = await createSession(req.user.id, req);
+  reply.setCookie(SESSION_COOKIE, signSession(req.user.id, sid), sessionCookieOptions());
 }
 
 export function sessionCookieOptions() {
@@ -93,17 +129,39 @@ export async function requireUser(req: FastifyRequest, reply: FastifyReply): Pro
   }
   let userId: string;
   let issuedAtMs = 0;
+  let sessionId: string | null = null;
   try {
-    const payload = jwt.verify(raw, config.jwtSecret) as { sub?: string; iat?: number };
+    const payload = jwt.verify(raw, config.jwtSecret) as { sub?: string; iat?: number; sid?: string };
     if (!payload.sub) throw new Error('no sub');
     userId = payload.sub;
     // jsonwebtoken always stamps iat; treat a token without one as unusable
     // rather than as "issued at the epoch", which would fail closed anyway.
     if (typeof payload.iat !== 'number') throw new Error('no iat');
     issuedAtMs = payload.iat * 1000;
+    sessionId = typeof payload.sid === 'string' ? payload.sid : null;
   } catch {
     reply.code(401).send({ error: 'invalid_session' });
     return reply;
+  }
+
+  // A session revoked individually (from the active-sessions list) is dead even
+  // though its JWT is still cryptographically valid and inside the global
+  // cut-off. Tokens minted before session tracking carry no sid and skip this.
+  if (sessionId) {
+    const session = await maybeOne<{ revoked_at: string | null }>(
+      'SELECT revoked_at FROM user_sessions WHERE id = $1 AND user_id = $2',
+      [sessionId, userId],
+    );
+    if (!session || session.revoked_at) {
+      reply.code(401).send({ error: 'session_revoked' });
+      return reply;
+    }
+    // Keep "last seen" roughly current without a write on every single request:
+    // only touch the row when it's more than a minute stale.
+    void query(
+      "UPDATE user_sessions SET last_seen_at = now() WHERE id = $1 AND last_seen_at < now() - interval '1 minute'",
+      [sessionId],
+    ).catch(() => { /* best-effort telemetry, never fail the request */ });
   }
   const user = await loadUser(userId);
   if (!user) {
@@ -177,12 +235,22 @@ export async function requirePlatformAdmin(req: FastifyRequest, reply: FastifyRe
 export async function requireApiTokenOrUser(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   const raw = bearerToken(req);
   if (raw?.startsWith('dvp_')) {
-    const row = await maybeOne<{ id: string; team_id: string }>(
-      'SELECT id, team_id FROM api_tokens WHERE token_hash = $1 AND revoked_at IS NULL',
+    const row = await maybeOne<{ id: string; team_id: string; expired: boolean }>(
+      `SELECT id, team_id, (expires_at IS NOT NULL AND expires_at <= now()) AS expired
+       FROM api_tokens WHERE token_hash = $1 AND revoked_at IS NULL`,
       [hashToken(raw)],
     );
     if (!row) {
       reply.code(401).send({ error: 'invalid_api_token' });
+      return reply;
+    }
+    // Distinguish expiry from "never existed": a CI job failing at 3am should
+    // say why, and an expired token is a fixable state, not a compromise.
+    if (row.expired) {
+      reply.code(401).send({
+        error: 'api_token_expired',
+        detail: 'This API token has expired. Create a new one in the dashboard under API tokens.',
+      });
       return reply;
     }
     // Opportunistically record the CLI version the caller advertises, alongside

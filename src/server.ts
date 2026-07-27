@@ -14,6 +14,7 @@ import contactRoutes from './routes/contact.js';
 import dataExportRoutes from './routes/dataExport.js';
 import environmentRoutes from './routes/environments.js';
 import hostRoutes from './routes/hosts.js';
+import sessionRoutes from './routes/sessions.js';
 import statusRoutes from './routes/status.js';
 import systemHealthRoutes from './routes/systemHealth.js';
 import teamRoutes from './routes/teams.js';
@@ -157,6 +158,7 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   await app.register(authRoutes);
   await app.register(twoFactorRoutes);
+  await app.register(sessionRoutes);
   await app.register(deviceAuthRoutes);
   await app.register(contactRoutes);
   await app.register(dataExportRoutes);

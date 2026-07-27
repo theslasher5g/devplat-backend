@@ -4,7 +4,8 @@ import { auditFromReq } from '../lib/audit.js';
 import { verifyPassword } from '../lib/passwords.js';
 import { hashToken } from '../lib/tokens.js';
 import { generateRecoveryCodes, generateSecret, otpauthUri, verifyTotp } from '../lib/totp.js';
-import { SESSION_COOKIE, requireUser, revokeSessions, sessionCookieOptions, signSession } from '../plugins/auth.js';
+import { establishSession, requireUser, revokeSessions } from '../plugins/auth.js';
+import { notifyTwoFactorDisabled } from '../lib/securityEvents.js';
 
 /**
  * TOTP two-factor enrolment and removal. The pattern throughout: a secret that
@@ -83,10 +84,8 @@ export default async function twoFactorRoutes(app: FastifyInstance): Promise<voi
     // password — otherwise an attacker already signed in keeps their access.
     await revokeSessions(req.user.id);
     await auditFromReq(req, '2fa.enable', { target: req.user.email });
-    return reply
-      .code(201)
-      .setCookie(SESSION_COOKIE, signSession(req.user.id), sessionCookieOptions())
-      .send({ ok: true, recoveryCodes: codes });
+    await establishSession(req, reply);
+    return reply.code(201).send({ ok: true, recoveryCodes: codes });
   });
 
   // Turning 2FA off is a downgrade of the account's security, so it needs the
@@ -136,8 +135,8 @@ export default async function twoFactorRoutes(app: FastifyInstance): Promise<voi
     });
     await revokeSessions(req.user.id);
     await auditFromReq(req, '2fa.disable', { target: req.user.email });
-    return reply
-      .setCookie(SESSION_COOKIE, signSession(req.user.id), sessionCookieOptions())
-      .send({ ok: true });
+    notifyTwoFactorDisabled(req, req.user.email);
+    await establishSession(req, reply);
+    return reply.send({ ok: true });
   });
 }

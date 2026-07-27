@@ -6,6 +6,7 @@ import ContactSubmission from '../emails/ContactSubmission.js';
 import HostOfflineAlert from '../emails/HostOfflineAlert.js';
 import PaymentFailed from '../emails/PaymentFailed.js';
 import ResetPassword from '../emails/ResetPassword.js';
+import SecurityAlert from '../emails/SecurityAlert.js';
 import TrialEnding from '../emails/TrialEnding.js';
 import StatusConfirm from '../emails/StatusConfirm.js';
 import StatusNotify from '../emails/StatusNotify.js';
@@ -89,6 +90,14 @@ export async function sendTrialEndingEmail(to: string, payload: {
     ? `Your devplat trial for ${payload.teamName} has ended`
     : `${payload.daysLeft} day${payload.daysLeft === 1 ? '' : 's'} left on your devplat trial`;
   await send(to, subject, TrialEnding({ ...payload, pricingUrl }), pricingUrl);
+}
+
+/** Account-security notification (new device, token created, 2FA off, ...).
+ *  See lib/securityEvents.ts for the events and why each one is worth a mail. */
+export async function sendSecurityAlertEmail(to: string, payload: {
+  headline: string; detail: string; whenText: string; contextLines: string[]; profileUrl: string;
+}): Promise<void> {
+  await send(to, `[devplat security] ${payload.headline}`, SecurityAlert(payload), payload.profileUrl);
 }
 
 /** Emails the ops inbox that a host dropped out of rotation. Best-effort — the

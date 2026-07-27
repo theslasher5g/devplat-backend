@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { maybeOne, query } from '../db.js';
 import { auditFromReq } from '../lib/audit.js';
 import { generateApiToken } from '../lib/tokens.js';
+import { notifyTokenCreated } from '../lib/securityEvents.js';
 import { requireMember } from '../plugins/auth.js';
 
 export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
@@ -12,8 +13,9 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
       query<{
         id: string; label: string; token_prefix: string; scope: string;
         created_at: string; last_used_at: string | null; last_cli_version: string | null;
+        expires_at: string | null;
       }>(
-        `SELECT id, label, token_prefix, scope, created_at, last_used_at, last_cli_version
+        `SELECT id, label, token_prefix, scope, created_at, last_used_at, last_cli_version, expires_at
          FROM api_tokens WHERE team_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC`,
         [teamId],
       ),
@@ -52,6 +54,7 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
           createdAt: t.created_at,
           lastUsedAt: t.last_used_at,
           lastCliVersion: t.last_cli_version,
+          expiresAt: t.expires_at,
           usage, // 14 daily run counts, oldest→newest
           runsTotal: usage.reduce((a, b) => a + b, 0),
         };
@@ -68,6 +71,9 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
         properties: {
           label: { type: 'string', minLength: 1, maxLength: 120 },
           scope: { type: 'string', enum: ['ci:run', 'dev:run'] },
+          // Optional lifetime. Omitted means "never expires", which stays the
+          // default so existing automation isn't broken by this being added.
+          expiresInDays: { type: 'integer', minimum: 1, maximum: 730 },
         },
       },
     },
@@ -75,14 +81,21 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
     // be able to spray out hundreds of long-lived tokens before anyone notices.
     config: { rateLimit: { max: 20, timeWindow: '1 hour' } },
   }, async (req, reply) => {
-    const { label, scope = 'ci:run' } = req.body as { label: string; scope?: 'ci:run' | 'dev:run' };
+    const { label, scope = 'ci:run', expiresInDays } = req.body as {
+      label: string; scope?: 'ci:run' | 'dev:run'; expiresInDays?: number;
+    };
     const { token, hash, prefix } = generateApiToken(scope);
-    const row = await query<{ id: string; created_at: string }>(
-      `INSERT INTO api_tokens (team_id, label, token_prefix, scope, token_hash)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-      [req.membership.teamId, label.trim(), prefix, scope, hash],
+    const row = await query<{ id: string; created_at: string; expires_at: string | null }>(
+      `INSERT INTO api_tokens (team_id, label, token_prefix, scope, token_hash, expires_at)
+       VALUES ($1, $2, $3, $4, $5, CASE WHEN $6::int IS NULL THEN NULL
+                                        ELSE now() + ($6 || ' days')::interval END)
+       RETURNING id, created_at, expires_at`,
+      [req.membership.teamId, label.trim(), prefix, scope, hash, expiresInDays ?? null],
     );
-    await auditFromReq(req, 'token.create', { target: label.trim(), detail: { scope, prefix } });
+    await auditFromReq(req, 'token.create', { target: label.trim(), detail: { scope, prefix, expiresInDays: expiresInDays ?? null } });
+    // Minting a credential is exactly the action an account-takeover would
+    // perform first; tell the user out-of-band.
+    notifyTokenCreated(req, req.user.email, label.trim());
     // The plaintext token is returned exactly once and never stored.
     return reply.code(201).send({
       token,
@@ -91,6 +104,7 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
       prefix,
       scope,
       createdAt: row.rows[0].created_at,
+      expiresAt: row.rows[0].expires_at,
     });
   });
 

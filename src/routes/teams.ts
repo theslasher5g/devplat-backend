@@ -6,6 +6,7 @@ import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { sendTeamInviteEmail } from '../lib/email.js';
 import { getOrCreateReferralCode } from '../lib/referral.js';
 import { stripe } from '../lib/stripe.js';
+import { notifyOwnershipTransferred } from '../lib/securityEvents.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { SESSION_COOKIE, requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser, sessionCookieOptions } from '../plugins/auth.js';
 
@@ -443,6 +444,10 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     });
     const newOwner = await maybeOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [userId]);
     await auditFromReq(req, 'team.transfer_ownership', { teamId, target: newOwner?.email ?? userId });
+    // Losing ownership of a team is a change the outgoing owner should hear
+    // about even if they didn't initiate it from this device.
+    const team = await maybeOne<{ name: string }>('SELECT name FROM teams WHERE id = $1', [teamId]);
+    notifyOwnershipTransferred(req, req.user.email, team?.name ?? 'your team', newOwner?.email ?? 'another member');
     return { ok: true };
   });
 

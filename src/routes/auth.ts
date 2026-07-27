@@ -6,9 +6,10 @@ import { hashPassword, verifyPassword, verifyPasswordConstantTime } from '../lib
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, checkPassword } from '../lib/passwordPolicy.js';
 import { linkReferral } from '../lib/referral.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
+import { noteLoginDevice, notifyPasswordChanged } from '../lib/securityEvents.js';
 import { verifyTotp } from '../lib/totp.js';
 import { getPlan } from '../plans.js';
-import { SESSION_COOKIE, requireUser, revokeSessions, sessionCookieOptions, signSession } from '../plugins/auth.js';
+import { SESSION_COOKIE, createSession, establishSession, requireUser, revokeSessions, sessionCookieOptions, signSession } from '../plugins/auth.js';
 
 const credentialsSchema = {
   type: 'object',
@@ -194,7 +195,11 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       if (failed) return reply.code(failed.code).send({ error: failed.error });
     }
 
-    const jwt = signSession(user.id);
+    // Record the session so it can be listed and revoked individually, and
+    // alert on a device we haven't seen for this account before.
+    const sessionId = await createSession(user.id, req);
+    void noteLoginDevice(req, user.id, email.trim().toLowerCase());
+    const jwt = signSession(user.id, sessionId);
     return reply
       .setCookie(SESSION_COOKIE, jwt, sessionCookieOptions())
       .send({ ok: true, token: jwt });
@@ -232,11 +237,11 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     // they think an attacker is already signed in.
     await revokeSessions(req.user.id);
     await auditFromReq(req, 'password.change', { target: req.user.email });
+    notifyPasswordChanged(req, req.user.email);
     // Re-issue this caller's own session so they aren't logged out by their
     // own action (the new token is minted after the cut-off).
-    return reply
-      .setCookie(SESSION_COOKIE, signSession(req.user.id), sessionCookieOptions())
-      .send({ ok: true });
+    await establishSession(req, reply);
+    return reply.send({ ok: true });
   });
 
   // Start an email change. The address is NOT switched here — a link goes to
