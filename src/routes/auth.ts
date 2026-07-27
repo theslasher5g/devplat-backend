@@ -2,13 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { auditFromReq } from '../lib/audit.js';
 import { sendPasswordResetEmail, sendVerificationEmail } from '../lib/email.js';
-import { hashPassword, verifyPassword } from '../lib/passwords.js';
+import { hashPassword, verifyPassword, verifyPasswordConstantTime } from '../lib/passwords.js';
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, checkPassword } from '../lib/passwordPolicy.js';
 import { linkReferral } from '../lib/referral.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { verifyTotp } from '../lib/totp.js';
 import { getPlan } from '../plans.js';
-import { SESSION_COOKIE, requireUser, sessionCookieOptions, signSession } from '../plugins/auth.js';
+import { SESSION_COOKIE, requireUser, revokeSessions, sessionCookieOptions, signSession } from '../plugins/auth.js';
 
 const credentialsSchema = {
   type: 'object',
@@ -176,7 +176,11 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
        FROM users WHERE email = $1`,
       [email.trim().toLowerCase()],
     );
-    if (!user || !(await verifyPassword(password, user.password_hash))) {
+    // Always runs bcrypt, even when no such account exists, so the response
+    // time can't be used to enumerate registered addresses. It returns false
+    // whenever there was no real hash, so `user` is non-null past this point.
+    const passwordOk = await verifyPasswordConstantTime(password, user?.password_hash);
+    if (!passwordOk || !user) {
       return reply.code(401).send({ error: 'invalid_credentials' });
     }
     if (!user.email_verified_at) {
@@ -224,8 +228,15 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     const weak = await checkPassword(newPassword);
     if (weak) return reply.code(400).send({ error: 'weak_password', detail: weak });
     await query('UPDATE users SET password_hash = $1 WHERE id = $2', [await hashPassword(newPassword), req.user.id]);
+    // Evict every other session: changing a password is what someone does when
+    // they think an attacker is already signed in.
+    await revokeSessions(req.user.id);
     void auditFromReq(req, 'password.change', { target: req.user.email });
-    return { ok: true };
+    // Re-issue this caller's own session so they aren't logged out by their
+    // own action (the new token is minted after the cut-off).
+    return reply
+      .setCookie(SESSION_COOKIE, signSession(req.user.id), sessionCookieOptions())
+      .send({ ok: true });
   });
 
   // Self-service account deletion. Password-gated, and refused for platform
@@ -422,6 +433,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       await tx.query('UPDATE verification_tokens SET used_at = now() WHERE id = $1', [row.id]);
       // A reset proves control of the mailbox — count it as verification too.
       await tx.query('UPDATE users SET email_verified_at = now() WHERE id = $1 AND email_verified_at IS NULL', [row.user_id]);
+      // A reset is the account-recovery path; anyone already signed in as this
+      // user (i.e. the reason for the reset) is signed out.
+      await tx.query('UPDATE users SET sessions_valid_from = now() WHERE id = $1', [row.user_id]);
     });
     return { ok: true };
   });

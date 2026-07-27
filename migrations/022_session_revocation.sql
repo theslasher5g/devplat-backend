@@ -1,0 +1,12 @@
+-- Session revocation cut-off.
+--
+-- Sessions are stateless JWTs, so until now an issued token stayed valid for
+-- its full 7 days no matter what happened to the account. That means changing
+-- your password — the thing people do precisely because they think someone
+-- else has access — did not actually evict that someone.
+--
+-- Every session JWT carries an `iat` (issued-at). Any token issued before this
+-- timestamp is rejected, so bumping it to now() logs out every existing session
+-- for that user. Set on password change/reset and on enabling or disabling 2FA.
+-- NULL means "nothing revoked yet", so existing sessions keep working.
+ALTER TABLE users ADD COLUMN sessions_valid_from timestamptz;

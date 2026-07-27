@@ -61,12 +61,27 @@ function normalizeCliVersion(raw: string | string[] | undefined): string | null 
   return value.startsWith('v') ? value : `v${value}`;
 }
 
-async function loadUser(userId: string): Promise<SessionUser | null> {
+async function loadUser(userId: string): Promise<(SessionUser & { sessionsValidFrom: string | null }) | null> {
   const row = await maybeOne<{
     id: string; email: string; email_verified_at: string | null; is_platform_admin: boolean;
-  }>('SELECT id, email, email_verified_at, is_platform_admin FROM users WHERE id = $1', [userId]);
+    sessions_valid_from: string | null;
+  }>(
+    'SELECT id, email, email_verified_at, is_platform_admin, sessions_valid_from FROM users WHERE id = $1',
+    [userId],
+  );
   if (!row) return null;
-  return { id: row.id, email: row.email, emailVerifiedAt: row.email_verified_at, isPlatformAdmin: row.is_platform_admin };
+  return {
+    id: row.id, email: row.email, emailVerifiedAt: row.email_verified_at,
+    isPlatformAdmin: row.is_platform_admin, sessionsValidFrom: row.sessions_valid_from,
+  };
+}
+
+/** Revoke every session issued to this user before now, by moving their
+ *  session cut-off forward. Called after a password change/reset and after
+ *  enabling or disabling 2FA — the points where the user is either recovering
+ *  from a suspected compromise or changing what "authenticated" means. */
+export async function revokeSessions(userId: string): Promise<void> {
+  await query('UPDATE users SET sessions_valid_from = now() WHERE id = $1', [userId]);
 }
 
 /** preHandler: requires a valid JWT session (cookie or Bearer JWT). */
@@ -77,10 +92,15 @@ export async function requireUser(req: FastifyRequest, reply: FastifyReply): Pro
     return reply;
   }
   let userId: string;
+  let issuedAtMs = 0;
   try {
-    const payload = jwt.verify(raw, config.jwtSecret) as { sub?: string };
+    const payload = jwt.verify(raw, config.jwtSecret) as { sub?: string; iat?: number };
     if (!payload.sub) throw new Error('no sub');
     userId = payload.sub;
+    // jsonwebtoken always stamps iat; treat a token without one as unusable
+    // rather than as "issued at the epoch", which would fail closed anyway.
+    if (typeof payload.iat !== 'number') throw new Error('no iat');
+    issuedAtMs = payload.iat * 1000;
   } catch {
     reply.code(401).send({ error: 'invalid_session' });
     return reply;
@@ -88,6 +108,15 @@ export async function requireUser(req: FastifyRequest, reply: FastifyReply): Pro
   const user = await loadUser(userId);
   if (!user) {
     reply.code(401).send({ error: 'invalid_session' });
+    return reply;
+  }
+  // Sessions issued before the user's revocation cut-off are dead: a password
+  // change or a 2FA change evicts everyone who was already signed in.
+  // `iat` has whole-second resolution, so allow the same second through —
+  // otherwise the token minted by the very request that bumped the cut-off
+  // would invalidate itself.
+  if (user.sessionsValidFrom && issuedAtMs + 1000 <= new Date(user.sessionsValidFrom).getTime()) {
+    reply.code(401).send({ error: 'session_revoked' });
     return reply;
   }
   req.user = user;
