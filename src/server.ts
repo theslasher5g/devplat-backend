@@ -16,6 +16,7 @@ import hostRoutes from './routes/hosts.js';
 import statusRoutes from './routes/status.js';
 import teamRoutes from './routes/teams.js';
 import tokenRoutes from './routes/tokens.js';
+import twoFactorRoutes from './routes/twofactor.js';
 import tunnelRoutes from './routes/tunnel.js';
 import webhookRoutes from './routes/webhooks.js';
 import { loadPlans } from './plans.js';
@@ -152,6 +153,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   });
 
   await app.register(authRoutes);
+  await app.register(twoFactorRoutes);
   await app.register(deviceAuthRoutes);
   await app.register(contactRoutes);
   await app.register(teamRoutes);
