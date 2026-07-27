@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type Stripe from 'stripe';
 import { config, tierForPrice } from '../config.js';
 import { maybeOne, query } from '../db.js';
+import { sendPaymentFailedEmail } from '../lib/email.js';
 import { rewardReferralOnSubscription } from '../lib/referral.js';
 import { requireStripe } from '../lib/stripe.js';
 
@@ -101,6 +102,30 @@ export default async function webhookRoutes(app: FastifyInstance): Promise<void>
           );
           await query("UPDATE teams SET plan_tier = 'free' WHERE id = $1", [teamId]);
         }
+        break;
+      }
+      // A failed charge is the start of involuntary churn: without a heads-up
+      // the customer's first signal is a broken pipeline days later, once
+      // Stripe has exhausted its retries and cancelled the subscription.
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object;
+        const teamId = await teamIdForEvent(invoice);
+        if (!teamId) break;
+        const owner = await maybeOne<{ email: string; name: string }>(
+          `SELECT u.email, t.name FROM teams t
+           JOIN team_members tm ON tm.team_id = t.id AND tm.role = 'owner'
+           JOIN users u ON u.id = tm.user_id
+           WHERE t.id = $1 LIMIT 1`,
+          [teamId],
+        );
+        if (!owner) break;
+        const amount = invoice.amount_due
+          ? `${(invoice.amount_due / 100).toFixed(2)} ${(invoice.currency ?? 'chf').toUpperCase()}`
+          : '';
+        // next_payment_attempt is null once Stripe has given up retrying.
+        const attemptsRemain = invoice.next_payment_attempt !== null;
+        await sendPaymentFailedEmail(owner.email, { teamName: owner.name, amount, attemptsRemain })
+          .catch((err: unknown) => req.log.warn({ err, teamId }, 'payment-failed email could not be sent'));
         break;
       }
       default:

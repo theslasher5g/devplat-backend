@@ -82,7 +82,7 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
        VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
       [req.membership.teamId, label.trim(), prefix, scope, hash],
     );
-    void auditFromReq(req, 'token.create', { target: label.trim(), detail: { scope, prefix } });
+    await auditFromReq(req, 'token.create', { target: label.trim(), detail: { scope, prefix } });
     // The plaintext token is returned exactly once and never stored.
     return reply.code(201).send({
       token,
@@ -101,7 +101,7 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
       [id, req.membership.teamId],
     );
     if (!found) return reply.code(404).send({ error: 'not_found' });
-    void auditFromReq(req, 'token.revoke', { target: found.label });
+    await auditFromReq(req, 'token.revoke', { target: found.label });
     return { ok: true };
   });
 }

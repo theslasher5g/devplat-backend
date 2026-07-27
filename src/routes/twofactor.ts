@@ -82,7 +82,7 @@ export default async function twoFactorRoutes(app: FastifyInstance): Promise<voi
     // Turning 2FA on should evict sessions that were established with only a
     // password — otherwise an attacker already signed in keeps their access.
     await revokeSessions(req.user.id);
-    void auditFromReq(req, '2fa.enable', { target: req.user.email });
+    await auditFromReq(req, '2fa.enable', { target: req.user.email });
     return reply
       .code(201)
       .setCookie(SESSION_COOKIE, signSession(req.user.id), sessionCookieOptions())
@@ -135,7 +135,7 @@ export default async function twoFactorRoutes(app: FastifyInstance): Promise<voi
       await tx.query('DELETE FROM two_factor_recovery_codes WHERE user_id = $1', [req.user.id]);
     });
     await revokeSessions(req.user.id);
-    void auditFromReq(req, '2fa.disable', { target: req.user.email });
+    await auditFromReq(req, '2fa.disable', { target: req.user.email });
     return reply
       .setCookie(SESSION_COOKIE, signSession(req.user.id), sessionCookieOptions())
       .send({ ok: true });

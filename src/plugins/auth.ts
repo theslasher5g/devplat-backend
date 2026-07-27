@@ -122,12 +122,25 @@ export async function requireUser(req: FastifyRequest, reply: FastifyReply): Pro
   req.user = user;
 }
 
-/** preHandler: requireUser + resolve the user's team membership. */
+/**
+ * preHandler: requireUser + resolve which team the user is acting in.
+ *
+ * A user can belong to several teams. `users.active_team_id` records the one
+ * they last switched to; it's only honoured if they're still a member of it
+ * (they may have left, or been removed, since). Otherwise — and for everyone
+ * who has never switched — this falls back to their oldest membership, which
+ * is the behaviour that existed before multi-team was finished.
+ */
 export async function requireMember(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   const denied = await requireUser(req, reply);
   if (denied) return denied;
   const row = await maybeOne<{ team_id: string; role: Membership['role'] }>(
-    'SELECT team_id, role FROM team_members WHERE user_id = $1 ORDER BY created_at LIMIT 1',
+    `SELECT tm.team_id, tm.role
+     FROM team_members tm
+     LEFT JOIN users u ON u.id = tm.user_id
+     WHERE tm.user_id = $1
+     ORDER BY (tm.team_id = u.active_team_id) DESC, tm.created_at
+     LIMIT 1`,
     [req.user.id],
   );
   if (!row) {

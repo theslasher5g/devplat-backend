@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { auditFromReq } from '../lib/audit.js';
-import { sendPasswordResetEmail, sendVerificationEmail } from '../lib/email.js';
+import { sendEmailChangeVerification, sendPasswordResetEmail, sendVerificationEmail } from '../lib/email.js';
 import { hashPassword, verifyPassword, verifyPasswordConstantTime } from '../lib/passwords.js';
 import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, checkPassword } from '../lib/passwordPolicy.js';
 import { linkReferral } from '../lib/referral.js';
@@ -23,7 +23,7 @@ const credentialsSchema = {
   },
 } as const;
 
-async function createOneTimeToken(userId: string, type: 'verify_email' | 'password_reset', ttlHours = 24): Promise<string> {
+async function createOneTimeToken(userId: string, type: 'verify_email' | 'password_reset' | 'email_change', ttlHours = 24): Promise<string> {
   const { token, hash } = generateOneTimeToken();
   // Invalidate previous tokens of the same type so only the latest link works.
   await query('DELETE FROM verification_tokens WHERE user_id = $1 AND type = $2', [userId, type]);
@@ -231,12 +231,81 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     // Evict every other session: changing a password is what someone does when
     // they think an attacker is already signed in.
     await revokeSessions(req.user.id);
-    void auditFromReq(req, 'password.change', { target: req.user.email });
+    await auditFromReq(req, 'password.change', { target: req.user.email });
     // Re-issue this caller's own session so they aren't logged out by their
     // own action (the new token is minted after the cut-off).
     return reply
       .setCookie(SESSION_COOKIE, signSession(req.user.id), sessionCookieOptions())
       .send({ ok: true });
+  });
+
+  // Start an email change. The address is NOT switched here — a link goes to
+  // the new mailbox and only clicking it completes the change, so a typo can't
+  // lock someone out of their own account.
+  app.post('/auth/change-email', {
+    preHandler: requireUser,
+    schema: {
+      body: {
+        type: 'object',
+        required: ['password', 'newEmail'],
+        properties: {
+          password: { type: 'string', maxLength: PASSWORD_MAX_LENGTH },
+          newEmail: { type: 'string', format: 'email', maxLength: 255 },
+        },
+      },
+    },
+    config: { rateLimit: { max: 5, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
+    const { password, newEmail } = req.body as { password: string; newEmail: string };
+    const normalized = newEmail.trim().toLowerCase();
+    const row = await one<{ password_hash: string; email: string }>(
+      'SELECT password_hash, email FROM users WHERE id = $1', [req.user.id],
+    );
+    if (!(await verifyPassword(password, row.password_hash))) {
+      return reply.code(401).send({ error: 'invalid_credentials' });
+    }
+    if (normalized === row.email) return reply.code(400).send({ error: 'same_email' });
+    const taken = await maybeOne('SELECT 1 FROM users WHERE email = $1', [normalized]);
+    if (taken) return reply.code(409).send({ error: 'email_taken' });
+
+    await query('UPDATE users SET pending_email = $1 WHERE id = $2', [normalized, req.user.id]);
+    const token = await createOneTimeToken(req.user.id, 'email_change');
+    await sendEmailChangeVerification(normalized, token).catch((err) => {
+      req.log.warn({ err }, 'email-change verification could not be sent');
+    });
+    await auditFromReq(req, 'email.change_requested', { target: normalized });
+    return { ok: true, pendingEmail: normalized };
+  });
+
+  // Complete the change by proving control of the new mailbox.
+  app.post('/auth/change-email/confirm', {
+    schema: { body: { type: 'object', required: ['token'], properties: { token: { type: 'string', maxLength: 200 } } } },
+    config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+  }, async (req, reply) => {
+    const { token } = req.body as { token: string };
+    const row = await maybeOne<{ id: string; user_id: string; pending_email: string | null }>(
+      `SELECT vt.id, vt.user_id, u.pending_email
+       FROM verification_tokens vt JOIN users u ON u.id = vt.user_id
+       WHERE vt.token_hash = $1 AND vt.type = 'email_change'
+         AND vt.used_at IS NULL AND vt.expires_at > now()`,
+      [hashToken(token)],
+    );
+    if (!row?.pending_email) return reply.code(400).send({ error: 'invalid_or_expired_token' });
+    // Re-check availability: someone else may have registered the address in
+    // the window between requesting the change and confirming it.
+    const taken = await maybeOne('SELECT 1 FROM users WHERE email = $1', [row.pending_email]);
+    if (taken) return reply.code(409).send({ error: 'email_taken' });
+
+    await withTransaction(async (tx) => {
+      await tx.query(
+        'UPDATE users SET email = $1, pending_email = NULL, email_verified_at = now() WHERE id = $2',
+        [row.pending_email, row.user_id],
+      );
+      await tx.query('UPDATE verification_tokens SET used_at = now() WHERE id = $1', [row.id]);
+      // The login identifier just changed — force a fresh sign-in everywhere.
+      await tx.query('UPDATE users SET sessions_valid_from = now() WHERE id = $1', [row.user_id]);
+    });
+    return { ok: true, email: row.pending_email };
   });
 
   // Self-service account deletion. Password-gated, and refused for platform

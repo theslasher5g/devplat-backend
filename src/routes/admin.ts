@@ -231,7 +231,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     const found = await query<{ name: string }>('UPDATE teams SET plan_override = $1 WHERE id = $2 RETURNING name', [planOverride, id]);
     if (found.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
     // Audit against the team so it shows in that team's log too.
-    void auditFromReq(req, planOverride ? 'plan.override.set' : 'plan.override.clear',
+    await auditFromReq(req, planOverride ? 'plan.override.set' : 'plan.override.clear',
       { teamId: id, target: found.rows[0].name, detail: { planOverride } });
     return { ok: true, planOverride, planOverrideLabel: planOverride ? getPlan(planOverride).label : null };
   });
@@ -296,7 +296,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         await tx.query('DELETE FROM teams WHERE id = ANY($1)', [soleTeams.rows.map((t) => t.team_id)]);
       }
     });
-    void auditFromReq(req, 'user.delete', { teamId: null, target: target.rows[0].email, detail: { userId: id, soleTeamsRemoved: soleTeams.rows.length } });
+    await auditFromReq(req, 'user.delete', { teamId: null, target: target.rows[0].email, detail: { userId: id, soleTeamsRemoved: soleTeams.rows.length } });
     return reply.code(204).send();
   });
 
@@ -337,7 +337,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     });
     // teamId: null — the team row is gone, so anchor the record at platform
     // level (with the name in target) instead of losing it to the cascade.
-    void auditFromReq(req, 'team.delete', { teamId: null, target: team.rows[0].name, detail: { teamId: id } });
+    await auditFromReq(req, 'team.delete', { teamId: null, target: team.rows[0].name, detail: { teamId: id } });
     return reply.code(204).send();
   });
 

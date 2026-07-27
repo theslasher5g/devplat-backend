@@ -9,7 +9,112 @@ import { stripe } from '../lib/stripe.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { SESSION_COOKIE, requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser, sessionCookieOptions } from '../plugins/auth.js';
 
+/**
+ * Seat cap check for a team's tier. Counts current members plus outstanding
+ * invites, so a team can't quietly exceed its plan by sending a batch of
+ * invites that all get accepted later. Returns an error body to send, or null
+ * when there's room for `adding` more people.
+ */
+async function seatLimitError(
+  teamId: string,
+  adding: number,
+): Promise<{ error: string; detail: string } | null> {
+  const team = await maybeOne<{ plan_tier: PlanTier }>(
+    'SELECT COALESCE(plan_override, plan_tier) AS plan_tier FROM teams WHERE id = $1', [teamId],
+  );
+  if (!team) return null;
+  const plan = getPlan(team.plan_tier);
+  if (plan.maxMembers === null) return null; // unlimited tier
+
+  const counts = await one<{ members: string; invites: string }>(
+    `SELECT (SELECT count(*) FROM team_members WHERE team_id = $1) AS members,
+            (SELECT count(*) FROM team_invites
+              WHERE team_id = $1 AND accepted_at IS NULL AND expires_at > now()) AS invites`,
+    [teamId],
+  );
+  const used = Number(counts.members) + Number(counts.invites);
+  if (used + adding <= plan.maxMembers) return null;
+  return {
+    error: 'seat_limit_reached',
+    detail: `The ${plan.label} plan includes ${plan.maxMembers} seat${plan.maxMembers === 1 ? '' : 's'} `
+      + `(${counts.members} member${counts.members === '1' ? '' : 's'}, ${counts.invites} pending invite${counts.invites === '1' ? '' : 's'}). `
+      + 'Upgrade the plan to add more people.',
+  };
+}
+
 export default async function teamRoutes(app: FastifyInstance): Promise<void> {
+  // Every team this user belongs to, with the one they're currently acting in
+  // flagged. Deliberately uses requireUser, not requireMember: a user with no
+  // team at all must still be able to see that (and then create one).
+  app.get('/teams', { preHandler: requireUser }, async (req) => {
+    const res = await query<{
+      id: string; name: string; role: string; plan_tier: PlanTier; created_at: string;
+      members: string; is_active: boolean;
+    }>(
+      `SELECT t.id, t.name, tm.role, COALESCE(t.plan_override, t.plan_tier) AS plan_tier,
+              tm.created_at,
+              (SELECT count(*) FROM team_members x WHERE x.team_id = t.id) AS members,
+              (t.id = u.active_team_id) AS is_active
+       FROM team_members tm
+       JOIN teams t ON t.id = tm.team_id
+       JOIN users u ON u.id = tm.user_id
+       WHERE tm.user_id = $1
+       ORDER BY tm.created_at`,
+      [req.user.id],
+    );
+    const teams = res.rows.map((t) => ({
+      id: t.id, name: t.name, role: t.role,
+      planTier: t.plan_tier, planLabel: getPlan(t.plan_tier).label,
+      members: Number(t.members), joinedAt: t.created_at, active: t.is_active,
+    }));
+    // Mirror requireMember's fallback so the UI highlights the same team the
+    // API is actually operating on when nothing has been chosen yet.
+    if (teams.length > 0 && !teams.some((t) => t.active)) teams[0].active = true;
+    return { teams };
+  });
+
+  // Switch which team subsequent requests act in.
+  app.post('/teams/switch', {
+    preHandler: requireUser,
+    schema: { body: { type: 'object', required: ['teamId'], properties: { teamId: { type: 'string', maxLength: 64 } } } },
+  }, async (req, reply) => {
+    const { teamId } = req.body as { teamId: string };
+    const member = await maybeOne<{ role: string }>(
+      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, req.user.id],
+    );
+    if (!member) return reply.code(403).send({ error: 'not_a_member' });
+    await query('UPDATE users SET active_team_id = $1 WHERE id = $2', [teamId, req.user.id]);
+    return { ok: true, teamId, role: member.role };
+  });
+
+  // Create a team. Without this, teams only ever came into existence during
+  // registration, so anyone who left or was removed from their only team was
+  // stranded on a dead account with no way back in.
+  app.post('/teams', {
+    preHandler: requireUser,
+    schema: { body: { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 1, maxLength: 100 } } } },
+    config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
+    const { name } = req.body as { name: string };
+    const trialDays = getPlan('free').trialDurationDays;
+    const teamId = await withTransaction(async (tx) => {
+      const t = await tx.query<{ id: string }>(
+        trialDays
+          ? "INSERT INTO teams (name, trial_ends_at) VALUES ($1, now() + ($2 || ' days')::interval) RETURNING id"
+          : 'INSERT INTO teams (name) VALUES ($1) RETURNING id',
+        trialDays ? [name.trim(), String(trialDays)] : [name.trim()],
+      );
+      const id = t.rows[0].id;
+      await tx.query("INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')", [id, req.user.id]);
+      // Land the user in the team they just made, rather than leaving them in
+      // whichever one the fallback would have picked.
+      await tx.query('UPDATE users SET active_team_id = $1 WHERE id = $2', [id, req.user.id]);
+      return id;
+    });
+    await auditFromReq(req, 'team.create', { teamId, target: name.trim() });
+    return reply.code(201).send({ ok: true, teamId });
+  });
+
   app.get('/teams/me', { preHandler: requireMember }, async (req) => {
     // Entitlement view: the effective tier (a manual plan_override if set, else
     // the billing plan_tier) drives the caps shown here. The billing plan and
@@ -85,7 +190,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   }, async (req) => {
     const { name } = req.body as { name: string };
     await query('UPDATE teams SET name = $1 WHERE id = $2', [name.trim(), req.membership.teamId]);
-    void auditFromReq(req, 'team.rename', { target: name.trim() });
+    await auditFromReq(req, 'team.rename', { target: name.trim() });
     return { ok: true };
   });
 
@@ -181,6 +286,11 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     );
     if (alreadyMember) return reply.code(409).send({ error: 'already_member' });
 
+    // Seat cap for the team's tier. Counts pending invites too, so a team
+    // can't overshoot its plan by sending a batch that all get accepted.
+    const seatErr = await seatLimitError(teamId, 1);
+    if (seatErr) return reply.code(409).send(seatErr);
+
     const { token, hash } = generateOneTimeToken();
     await query('DELETE FROM team_invites WHERE team_id = $1 AND email = $2 AND accepted_at IS NULL', [teamId, normalized]);
     await query(
@@ -189,7 +299,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
       [teamId, normalized, role, hash, req.user.id],
     );
     const team = await one<{ name: string }>('SELECT name FROM teams WHERE id = $1', [teamId]);
-    void auditFromReq(req, 'member.invite', { target: normalized, detail: { role } });
+    await auditFromReq(req, 'member.invite', { target: normalized, detail: { role } });
     // Best-effort: the invite row is already committed above.
     await sendTeamInviteEmail(normalized, token, team.name, req.user.email, role).catch((err) => {
       req.log.warn({ err }, 'team invite email failed to send');
@@ -225,6 +335,19 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
+  // Withdraw a pending invitation. The dashboard listed them with no way to
+  // take one back — a mistyped address would otherwise stay valid for 7 days.
+  app.delete('/teams/me/invites/:id', { preHandler: requireTeamAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const gone = await maybeOne<{ email: string }>(
+      'DELETE FROM team_invites WHERE id = $1 AND team_id = $2 AND accepted_at IS NULL RETURNING email',
+      [id, req.membership.teamId],
+    );
+    if (!gone) return reply.code(404).send({ error: 'not_found' });
+    await auditFromReq(req, 'member.invite_revoke', { target: gone.email });
+    return { ok: true };
+  });
+
   // Accept as a logged-in user whose email matches the invite.
   app.post('/invites/:token/accept', { preHandler: requireUser }, async (req, reply) => {
     const { token } = req.params as { token: string };
@@ -235,6 +358,11 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     );
     if (!invite) return reply.code(404).send({ error: 'invalid_or_expired_invite' });
     if (invite.email !== req.user.email) return reply.code(403).send({ error: 'invite_for_different_email' });
+    // Re-check the cap at accept time: the team may have filled up, or been
+    // downgraded, in the days since the invite was sent. This invite is
+    // already counted in the pending total, so it isn't double-counted.
+    const seatErr = await seatLimitError(invite.team_id, 0);
+    if (seatErr) return reply.code(409).send(seatErr);
     await withTransaction(async (tx) => {
       await tx.query(
         `INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3)
@@ -242,6 +370,8 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         [invite.team_id, req.user.id, invite.role],
       );
       await tx.query('UPDATE team_invites SET accepted_at = now() WHERE id = $1', [invite.id]);
+      // Joining a team is an explicit act — make it the one they land in.
+      await tx.query('UPDATE users SET active_team_id = $1 WHERE id = $2', [invite.team_id, req.user.id]);
     });
     return { ok: true, teamId: invite.team_id };
   });
@@ -280,7 +410,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     const teamId = req.membership.teamId;
     await query('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, req.user.id]);
     // Audited against the team so the remaining admins can see who left.
-    void auditFromReq(req, 'member.leave', { teamId, target: req.user.email });
+    await auditFromReq(req, 'member.leave', { teamId, target: req.user.email });
     return { ok: true };
   });
 
@@ -312,7 +442,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
       await tx.query("UPDATE team_members SET role = 'admin' WHERE team_id = $1 AND user_id = $2", [teamId, req.user.id]);
     });
     const newOwner = await maybeOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [userId]);
-    void auditFromReq(req, 'team.transfer_ownership', { teamId, target: newOwner?.email ?? userId });
+    await auditFromReq(req, 'team.transfer_ownership', { teamId, target: newOwner?.email ?? userId });
     return { ok: true };
   });
 
@@ -328,7 +458,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     // Removing someone's access is exactly the kind of action an audit trail
     // exists for; it was the only member mutation not being recorded.
     const removed = await maybeOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [userId]);
-    void auditFromReq(req, 'member.remove', { target: removed?.email ?? userId, detail: { role: target.role } });
+    await auditFromReq(req, 'member.remove', { target: removed?.email ?? userId, detail: { role: target.role } });
     return { ok: true };
   });
 }

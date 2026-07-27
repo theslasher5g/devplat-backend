@@ -11,9 +11,11 @@ import authRoutes from './routes/auth.js';
 import deviceAuthRoutes from './routes/deviceAuth.js';
 import billingRoutes from './routes/billing.js';
 import contactRoutes from './routes/contact.js';
+import dataExportRoutes from './routes/dataExport.js';
 import environmentRoutes from './routes/environments.js';
 import hostRoutes from './routes/hosts.js';
 import statusRoutes from './routes/status.js';
+import systemHealthRoutes from './routes/systemHealth.js';
 import teamRoutes from './routes/teams.js';
 import tokenRoutes from './routes/tokens.js';
 import twoFactorRoutes from './routes/twofactor.js';
@@ -22,6 +24,7 @@ import webhookRoutes from './routes/webhooks.js';
 import { loadPlans } from './plans.js';
 import { startHealthPoller } from './scheduler/healthPoller.js';
 import { startQueueWorker } from './scheduler/queueWorker.js';
+import { startTrialNoticeWorker } from './scheduler/trialNotices.js';
 
 /** The set of browser origins allowed to call the API with credentials: the
  *  configured frontend URL, its apex↔www counterpart, and the local dev origin.
@@ -156,12 +159,14 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(twoFactorRoutes);
   await app.register(deviceAuthRoutes);
   await app.register(contactRoutes);
+  await app.register(dataExportRoutes);
   await app.register(teamRoutes);
   await app.register(tokenRoutes);
   await app.register(billingRoutes);
   await app.register(webhookRoutes);
   await app.register(adminRoutes);
   await app.register(hostRoutes);
+  await app.register(systemHealthRoutes);
   await app.register(statusRoutes);
   await app.register(environmentRoutes);
   await app.register(tunnelRoutes);
@@ -171,9 +176,13 @@ export async function buildServer(): Promise<FastifyInstance> {
   // cpu_used / ram_used_mb current.
   const stopQueueWorker = startQueueWorker(config.schedulerPollIntervalMs);
   const stopHealthPoller = startHealthPoller(config.schedulerPollIntervalMs);
+  // Warns owners before a free trial lapses; without it the first sign is a
+  // failing pipeline once parallelism drops to zero.
+  const stopTrialNotices = startTrialNoticeWorker();
   app.addHook('onClose', async () => {
     stopQueueWorker();
     stopHealthPoller();
+    stopTrialNotices();
   });
 
   return app;

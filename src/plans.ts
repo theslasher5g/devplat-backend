@@ -18,6 +18,8 @@ export interface Plan {
   ramMbPerEnv: number;
   /** Only Free Trial is time-boxed; null for paid tiers. */
   trialDurationDays: number | null;
+  /** Seat cap for the team; null means unlimited (top tier). */
+  maxMembers: number | null;
 }
 
 const TIER_ORDER: PlanTier[] = ['free', 'solo', 'team', 'scale'];
@@ -29,9 +31,11 @@ export async function loadPlans(): Promise<void> {
     id: PlanTier; name: string; price_chf_monthly: number;
     max_parallel_environments: number; vcpu_per_environment: number;
     ram_gb_per_environment: number; trial_duration_days: number | null;
+    max_members: number | null;
   }>(
     `SELECT id, name, price_chf_monthly, max_parallel_environments,
-            vcpu_per_environment, ram_gb_per_environment, trial_duration_days
+            vcpu_per_environment, ram_gb_per_environment, trial_duration_days,
+            max_members
      FROM plans`,
   );
   const map = {} as Record<PlanTier, Plan>;
@@ -44,6 +48,7 @@ export async function loadPlans(): Promise<void> {
       vcpuPerEnv: r.vcpu_per_environment,
       ramMbPerEnv: r.ram_gb_per_environment * 1024,
       trialDurationDays: r.trial_duration_days,
+      maxMembers: r.max_members,
     };
   }
   for (const tier of TIER_ORDER) {
