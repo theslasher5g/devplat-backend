@@ -264,6 +264,58 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
+  // Self-service: leave the team you're in. The owner can't leave — they'd
+  // orphan the team, its subscription and its billing contact — so ownership
+  // has to be handed over first (or the team deleted outright).
+  app.post('/teams/me/leave', {
+    preHandler: requireMember,
+    config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
+    if (req.membership.role === 'owner') {
+      return reply.code(409).send({
+        error: 'owner_cannot_leave',
+        detail: 'Transfer ownership to another member first, or delete the team.',
+      });
+    }
+    const teamId = req.membership.teamId;
+    await query('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, req.user.id]);
+    // Audited against the team so the remaining admins can see who left.
+    void auditFromReq(req, 'member.leave', { teamId, target: req.user.email });
+    return { ok: true };
+  });
+
+  // Hand the owner role to another member. The outgoing owner stays on as an
+  // admin rather than being dropped, so they don't lose access by accident;
+  // leaving afterwards is a separate, deliberate step.
+  app.post('/teams/me/transfer-ownership', {
+    preHandler: requireMember,
+    schema: {
+      body: { type: 'object', required: ['userId'], properties: { userId: { type: 'string', maxLength: 64 } } },
+    },
+    config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
+    if (req.membership.role !== 'owner') {
+      return reply.code(403).send({ error: 'owner_required', detail: 'Only the current owner can transfer ownership.' });
+    }
+    const { userId } = req.body as { userId: string };
+    if (userId === req.user.id) return reply.code(400).send({ error: 'already_owner' });
+    const teamId = req.membership.teamId;
+    const target = await maybeOne<{ role: string }>(
+      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, userId],
+    );
+    if (!target) return reply.code(404).send({ error: 'not_a_member' });
+
+    // Both role changes in one transaction: a team must never end up with two
+    // owners or none if this fails halfway.
+    await withTransaction(async (tx) => {
+      await tx.query("UPDATE team_members SET role = 'owner' WHERE team_id = $1 AND user_id = $2", [teamId, userId]);
+      await tx.query("UPDATE team_members SET role = 'admin' WHERE team_id = $1 AND user_id = $2", [teamId, req.user.id]);
+    });
+    const newOwner = await maybeOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [userId]);
+    void auditFromReq(req, 'team.transfer_ownership', { teamId, target: newOwner?.email ?? userId });
+    return { ok: true };
+  });
+
   app.delete('/teams/me/members/:userId', { preHandler: requireTeamAdmin }, async (req, reply) => {
     const { userId } = req.params as { userId: string };
     const target = await maybeOne<{ role: string }>(
@@ -273,6 +325,10 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     if (!target) return reply.code(404).send({ error: 'not_a_member' });
     if (target.role === 'owner') return reply.code(403).send({ error: 'cannot_remove_owner' });
     await query('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [req.membership.teamId, userId]);
+    // Removing someone's access is exactly the kind of action an audit trail
+    // exists for; it was the only member mutation not being recorded.
+    const removed = await maybeOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [userId]);
+    void auditFromReq(req, 'member.remove', { target: removed?.email ?? userId, detail: { role: target.role } });
     return { ok: true };
   });
 }
