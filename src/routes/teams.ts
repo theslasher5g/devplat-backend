@@ -43,6 +43,48 @@ async function seatLimitError(
   };
 }
 
+/** Parses the audit list/export query into safe, parameterised filter values.
+ *  Everything is nullable so a single SQL statement handles every combination
+ *  via `($n IS NULL OR ...)` rather than string-building a WHERE clause. */
+function auditFilters(q: Record<string, string | undefined>): {
+  from: string | null; to: string | null; action: string | null; actorLike: string | null;
+  limit: number; offset: number;
+} {
+  const date = (v: string | undefined): string | null => {
+    if (!v) return null;
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? new Date(t).toISOString() : null;
+  };
+  const num = (v: string | undefined, def: number, max: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? Math.min(Math.trunc(n), max) : def;
+  };
+  const actor = q.actor?.trim();
+  return {
+    from: date(q.from),
+    to: date(q.to),
+    action: q.action?.trim() || null,
+    // ILIKE with wrapped wildcards: an operator searching "@acme.com" should
+    // match every address at that domain.
+    actorLike: actor ? `%${actor}%` : null,
+    limit: num(q.limit, 50, 200),
+    offset: num(q.offset, 0, 100_000),
+  };
+}
+
+/** ISO 8601 for export columns, whatever the driver handed us. */
+function isoTimestamp(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : String(value);
+}
+
+/** RFC 4180 cell: quote when needed, and double any embedded quotes. */
+function csvCell(value: string): string {
+  const s = String(value ?? '');
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
 export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   // Every team this user belongs to, with the one they're currently acting in
   // flagged. Deliberately uses requireUser, not requireMember: a user with no
@@ -177,12 +219,133 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   // audit trail (tokens, members, renames, and any admin plan override applied
   // to it), newest first.
   app.get('/teams/me/audit', { preHandler: requireTeamAdmin }, async (req) => {
+    const f = auditFilters(req.query as Record<string, string | undefined>);
     const res = await query<AuditRow>(
       `SELECT id, action, target, actor_email, detail, created_at, team_id
-       FROM audit_log WHERE team_id = $1 ORDER BY created_at DESC LIMIT 50`,
+       FROM audit_log
+       WHERE team_id = $1
+         AND ($2::timestamptz IS NULL OR created_at >= $2)
+         AND ($3::timestamptz IS NULL OR created_at < $3)
+         AND ($4::text IS NULL OR action = $4)
+         AND ($5::text IS NULL OR actor_email ILIKE $5)
+       ORDER BY created_at DESC
+       LIMIT $6 OFFSET $7`,
+      [req.membership.teamId, f.from, f.to, f.action, f.actorLike, f.limit, f.offset],
+    );
+    const total = await one<{ count: string }>(
+      `SELECT count(*) FROM audit_log
+       WHERE team_id = $1
+         AND ($2::timestamptz IS NULL OR created_at >= $2)
+         AND ($3::timestamptz IS NULL OR created_at < $3)
+         AND ($4::text IS NULL OR action = $4)
+         AND ($5::text IS NULL OR actor_email ILIKE $5)`,
+      [req.membership.teamId, f.from, f.to, f.action, f.actorLike],
+    );
+    return { entries: res.rows.map(serializeAudit), total: Number(total.count), limit: f.limit, offset: f.offset };
+  });
+
+  // The distinct actions this team has actually recorded, so the UI can offer a
+  // filter dropdown of real values instead of a hardcoded guess.
+  app.get('/teams/me/audit/actions', { preHandler: requireTeamAdmin }, async (req) => {
+    const res = await query<{ action: string }>(
+      'SELECT DISTINCT action FROM audit_log WHERE team_id = $1 ORDER BY action',
       [req.membership.teamId],
     );
-    return { entries: res.rows.map(serializeAudit) };
+    return { actions: res.rows.map((r) => r.action) };
+  });
+
+  // Export the (filtered) trail. Compliance reviews ask for the whole record as
+  // a file, not a paginated screen — CSV for spreadsheets, JSON for tooling.
+  app.get('/teams/me/audit/export', {
+    preHandler: requireTeamAdmin,
+    config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
+  }, async (req, reply) => {
+    const q = req.query as Record<string, string | undefined>;
+    const f = auditFilters(q);
+    const format = q.format === 'json' ? 'json' : 'csv';
+    const res = await query<AuditRow>(
+      `SELECT id, action, target, actor_email, detail, created_at, team_id
+       FROM audit_log
+       WHERE team_id = $1
+         AND ($2::timestamptz IS NULL OR created_at >= $2)
+         AND ($3::timestamptz IS NULL OR created_at < $3)
+         AND ($4::text IS NULL OR action = $4)
+         AND ($5::text IS NULL OR actor_email ILIKE $5)
+       ORDER BY created_at DESC
+       LIMIT 10000`,
+      [req.membership.teamId, f.from, f.to, f.action, f.actorLike],
+    );
+    const entries = res.rows.map(serializeAudit);
+    await auditFromReq(req, 'audit.export', { detail: { format, rows: entries.length } });
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    if (format === 'json') {
+      return reply
+        .header('content-type', 'application/json; charset=utf-8')
+        .header('content-disposition', `attachment; filename="devplat-audit-${stamp}.json"`)
+        .send(JSON.stringify({ exportedAt: new Date().toISOString(), entries }, null, 2));
+    }
+    const header = 'timestamp,action,actor,target,detail\n';
+    const body = entries.map((e) => [
+      // node-postgres hands back a Date for timestamptz; JSON.stringify would
+      // render that as ISO but String() gives "Mon Jul 27 2026 …", which no
+      // spreadsheet sorts correctly. Normalise explicitly.
+      isoTimestamp(e.createdAt),
+      e.action, e.actorEmail ?? '', e.target ?? '', JSON.stringify(e.detail ?? {}),
+    ].map(csvCell).join(',')).join('\n');
+    return reply
+      .header('content-type', 'text/csv; charset=utf-8')
+      .header('content-disposition', `attachment; filename="devplat-audit-${stamp}.csv"`)
+      .send(header + body + (body ? '\n' : ''));
+  });
+
+  // Team security policy. Requiring 2FA is owner-only: it can lock members out
+  // of the team's resources until they enrol, which isn't an admin-level call.
+  app.patch('/teams/me/security', {
+    preHandler: requireMember,
+    schema: {
+      body: { type: 'object', required: ['requireTwoFactor'], properties: { requireTwoFactor: { type: 'boolean' } } },
+    },
+  }, async (req, reply) => {
+    if (req.membership.role !== 'owner') {
+      return reply.code(403).send({ error: 'owner_required', detail: 'Only the team owner can change the security policy.' });
+    }
+    const { requireTwoFactor } = req.body as { requireTwoFactor: boolean };
+    if (requireTwoFactor) {
+      // Refuse to switch it on while the owner themselves has no second factor:
+      // they'd immediately lock themselves out of their own team.
+      const self = await one<{ has_totp: boolean }>(
+        'SELECT (totp_enabled_at IS NOT NULL) AS has_totp FROM users WHERE id = $1', [req.user.id],
+      );
+      if (!self.has_totp) {
+        return reply.code(409).send({
+          error: 'enable_own_2fa_first',
+          detail: 'Set up two-factor authentication on your own account before requiring it for the team.',
+        });
+      }
+    }
+    await query('UPDATE teams SET require_two_factor = $1 WHERE id = $2', [requireTwoFactor, req.membership.teamId]);
+    await auditFromReq(req, requireTwoFactor ? 'team.2fa_required' : 'team.2fa_optional', { target: req.user.email });
+    return { ok: true, requireTwoFactor };
+  });
+
+  // Who on the team still needs to enrol — so an owner can chase people rather
+  // than discovering the gap when someone is locked out.
+  app.get('/teams/me/security', { preHandler: requireTeamAdmin }, async (req) => {
+    const team = await one<{ require_two_factor: boolean }>(
+      'SELECT require_two_factor FROM teams WHERE id = $1', [req.membership.teamId],
+    );
+    const members = await query<{ email: string; has_totp: boolean }>(
+      `SELECT u.email, (u.totp_enabled_at IS NOT NULL) AS has_totp
+       FROM team_members tm JOIN users u ON u.id = tm.user_id
+       WHERE tm.team_id = $1 ORDER BY u.email`,
+      [req.membership.teamId],
+    );
+    return {
+      requireTwoFactor: team.require_two_factor,
+      members: members.rows.map((m) => ({ email: m.email, twoFactorEnabled: m.has_totp })),
+      withoutTwoFactor: members.rows.filter((m) => !m.has_totp).length,
+    };
   });
 
   app.patch('/teams/me', {

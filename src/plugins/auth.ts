@@ -82,6 +82,14 @@ export function sessionCookieOptions() {
   };
 }
 
+/** Cheap guard so only something that looks like an address is handed to
+ *  Postgres's inet cast. Anything else becomes NULL, which fails the allowlist
+ *  check closed rather than erroring the request. */
+function isIpLiteral(ip: string | undefined): boolean {
+  if (!ip) return false;
+  return /^[0-9.]+$/.test(ip) || /^[0-9a-fA-F:.]+$/.test(ip);
+}
+
 function bearerToken(req: FastifyRequest): string | null {
   const header = req.headers.authorization;
   if (header?.startsWith('Bearer ')) return header.slice(7);
@@ -192,10 +200,14 @@ export async function requireUser(req: FastifyRequest, reply: FastifyReply): Pro
 export async function requireMember(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   const denied = await requireUser(req, reply);
   if (denied) return denied;
-  const row = await maybeOne<{ team_id: string; role: Membership['role'] }>(
-    `SELECT tm.team_id, tm.role
+  const row = await maybeOne<{
+    team_id: string; role: Membership['role']; require_two_factor: boolean; has_totp: boolean;
+  }>(
+    `SELECT tm.team_id, tm.role, t.require_two_factor,
+            (u.totp_enabled_at IS NOT NULL) AS has_totp
      FROM team_members tm
      LEFT JOIN users u ON u.id = tm.user_id
+     JOIN teams t ON t.id = tm.team_id
      WHERE tm.user_id = $1
      ORDER BY (tm.team_id = u.active_team_id) DESC, tm.created_at
      LIMIT 1`,
@@ -203,6 +215,18 @@ export async function requireMember(req: FastifyRequest, reply: FastifyReply): P
   );
   if (!row) {
     reply.code(403).send({ error: 'no_team' });
+    return reply;
+  }
+  // Team policy: no access to the team's resources without a second factor.
+  // Deliberately enforced here and not in requireUser, because the endpoints a
+  // member needs in order to comply — /auth/2fa/setup, /auth/2fa/enable, the
+  // profile — authenticate with requireUser. Turning this on is a prompt to
+  // enrol, not a lockout.
+  if (row.require_two_factor && !row.has_totp) {
+    reply.code(403).send({
+      error: 'two_factor_required',
+      detail: 'This team requires two-factor authentication. Enable it under Profile to regain access.',
+    });
     return reply;
   }
   req.membership = { teamId: row.team_id, role: row.role };
@@ -235,10 +259,19 @@ export async function requirePlatformAdmin(req: FastifyRequest, reply: FastifyRe
 export async function requireApiTokenOrUser(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   const raw = bearerToken(req);
   if (raw?.startsWith('dvp_')) {
-    const row = await maybeOne<{ id: string; team_id: string; expired: boolean }>(
-      `SELECT id, team_id, (expires_at IS NOT NULL AND expires_at <= now()) AS expired
+    // ip_allowed is computed in SQL so CIDR containment uses Postgres's own
+    // inet operators — correct for IPv4 and IPv6 without hand-rolled masking.
+    // A malformed req.ip can't throw here: it's cast inside a guarded CASE.
+    const row = await maybeOne<{ id: string; team_id: string; expired: boolean; ip_allowed: boolean }>(
+      `SELECT id, team_id,
+              (expires_at IS NOT NULL AND expires_at <= now()) AS expired,
+              CASE
+                WHEN ip_allowlist IS NULL OR cardinality(ip_allowlist) = 0 THEN true
+                WHEN $2::text IS NULL THEN false
+                ELSE $2::inet <<= ANY(ip_allowlist)
+              END AS ip_allowed
        FROM api_tokens WHERE token_hash = $1 AND revoked_at IS NULL`,
-      [hashToken(raw)],
+      [hashToken(raw), isIpLiteral(req.ip) ? req.ip : null],
     );
     if (!row) {
       reply.code(401).send({ error: 'invalid_api_token' });
@@ -250,6 +283,15 @@ export async function requireApiTokenOrUser(req: FastifyRequest, reply: FastifyR
       reply.code(401).send({
         error: 'api_token_expired',
         detail: 'This API token has expired. Create a new one in the dashboard under API tokens.',
+      });
+      return reply;
+    }
+    // A token restricted to certain networks is refused elsewhere, and says so:
+    // "works from CI, fails from my laptop" should be diagnosable in one read.
+    if (!row.ip_allowed) {
+      reply.code(403).send({
+        error: 'ip_not_allowed',
+        detail: `This API token is restricted to specific IP ranges, and ${req.ip} is not one of them.`,
       });
       return reply;
     }

@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { maybeOne, query } from '../db.js';
 import { auditFromReq } from '../lib/audit.js';
 import { generateApiToken } from '../lib/tokens.js';
+import { isValidCidr, normalizeCidr } from '../lib/cidr.js';
 import { notifyTokenCreated } from '../lib/securityEvents.js';
 import { requireMember } from '../plugins/auth.js';
 
@@ -13,9 +14,10 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
       query<{
         id: string; label: string; token_prefix: string; scope: string;
         created_at: string; last_used_at: string | null; last_cli_version: string | null;
-        expires_at: string | null;
+        expires_at: string | null; ip_allowlist: string[] | null;
       }>(
-        `SELECT id, label, token_prefix, scope, created_at, last_used_at, last_cli_version, expires_at
+        `SELECT id, label, token_prefix, scope, created_at, last_used_at, last_cli_version, expires_at,
+                ip_allowlist::text[] AS ip_allowlist
          FROM api_tokens WHERE team_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC`,
         [teamId],
       ),
@@ -55,6 +57,7 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
           lastUsedAt: t.last_used_at,
           lastCliVersion: t.last_cli_version,
           expiresAt: t.expires_at,
+          ipAllowlist: t.ip_allowlist ?? [],
           usage, // 14 daily run counts, oldest→newest
           runsTotal: usage.reduce((a, b) => a + b, 0),
         };
@@ -74,6 +77,9 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
           // Optional lifetime. Omitted means "never expires", which stays the
           // default so existing automation isn't broken by this being added.
           expiresInDays: { type: 'integer', minimum: 1, maximum: 730 },
+          // Optional CIDR allowlist, e.g. ["203.0.113.0/24"]. Empty/omitted
+          // means the token works from anywhere, which stays the default.
+          ipAllowlist: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 64 } },
         },
       },
     },
@@ -81,16 +87,28 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
     // be able to spray out hundreds of long-lived tokens before anyone notices.
     config: { rateLimit: { max: 20, timeWindow: '1 hour' } },
   }, async (req, reply) => {
-    const { label, scope = 'ci:run', expiresInDays } = req.body as {
-      label: string; scope?: 'ci:run' | 'dev:run'; expiresInDays?: number;
+    const { label, scope = 'ci:run', expiresInDays, ipAllowlist } = req.body as {
+      label: string; scope?: 'ci:run' | 'dev:run'; expiresInDays?: number; ipAllowlist?: string[];
     };
+    // Validate CIDRs before storing: a typo here would silently lock a CI
+    // pipeline out, and the failure would surface far from its cause.
+    const rawCidrs = (ipAllowlist ?? []).map((c) => c.trim()).filter(Boolean);
+    for (const c of rawCidrs) {
+      if (!isValidCidr(c)) {
+        return reply.code(400).send({
+          error: 'invalid_cidr',
+          detail: `"${c}" is not a valid IP address or CIDR range (e.g. 203.0.113.4 or 203.0.113.0/24).`,
+        });
+      }
+    }
     const { token, hash, prefix } = generateApiToken(scope);
     const row = await query<{ id: string; created_at: string; expires_at: string | null }>(
-      `INSERT INTO api_tokens (team_id, label, token_prefix, scope, token_hash, expires_at)
-       VALUES ($1, $2, $3, $4, $5, CASE WHEN $6::int IS NULL THEN NULL
-                                        ELSE now() + ($6 || ' days')::interval END)
+      `INSERT INTO api_tokens (team_id, label, token_prefix, scope, token_hash, expires_at, ip_allowlist)
+       VALUES ($1, $2, $3, $4, $5,
+               CASE WHEN $6::int IS NULL THEN NULL ELSE now() + ($6 || ' days')::interval END,
+               CASE WHEN cardinality($7::text[]) = 0 THEN NULL ELSE $7::cidr[] END)
        RETURNING id, created_at, expires_at`,
-      [req.membership.teamId, label.trim(), prefix, scope, hash, expiresInDays ?? null],
+      [req.membership.teamId, label.trim(), prefix, scope, hash, expiresInDays ?? null, rawCidrs.map(normalizeCidr)],
     );
     await auditFromReq(req, 'token.create', { target: label.trim(), detail: { scope, prefix, expiresInDays: expiresInDays ?? null } });
     // Minting a credential is exactly the action an account-takeover would
