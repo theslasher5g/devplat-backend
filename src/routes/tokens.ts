@@ -71,6 +71,9 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
         },
       },
     },
+    // Minting credentials is a privileged action; a hijacked session shouldn't
+    // be able to spray out hundreds of long-lived tokens before anyone notices.
+    config: { rateLimit: { max: 20, timeWindow: '1 hour' } },
   }, async (req, reply) => {
     const { label, scope = 'ci:run' } = req.body as { label: string; scope?: 'ci:run' | 'dev:run' };
     const { token, hash, prefix } = generateApiToken(scope);

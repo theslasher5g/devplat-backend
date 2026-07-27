@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { maybeOne, query, withTransaction } from '../db.js';
 import { sendPasswordResetEmail, sendVerificationEmail } from '../lib/email.js';
 import { hashPassword, verifyPassword } from '../lib/passwords.js';
+import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, checkPassword } from '../lib/passwordPolicy.js';
 import { linkReferral } from '../lib/referral.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { getPlan } from '../plans.js';
@@ -12,7 +13,9 @@ const credentialsSchema = {
   required: ['email', 'password'],
   properties: {
     email: { type: 'string', format: 'email', maxLength: 255 },
-    password: { type: 'string', minLength: 10, maxLength: 200 },
+    // Schema enforces length only; complexity + breach checks run in the
+    // handler via checkPassword() so we can return a specific reason.
+    password: { type: 'string', minLength: PASSWORD_MIN_LENGTH, maxLength: PASSWORD_MAX_LENGTH },
     teamName: { type: 'string', minLength: 1, maxLength: 100 },
     referralCode: { type: 'string', maxLength: 32 },
   },
@@ -40,6 +43,9 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
   }, async (req, reply) => {
     const { email, password, teamName, referralCode } = req.body as { email: string; password: string; teamName?: string; referralCode?: string };
     const normalized = email.trim().toLowerCase();
+
+    const weak = await checkPassword(password);
+    if (weak) return reply.code(400).send({ error: 'weak_password', detail: weak });
 
     const existing = await maybeOne('SELECT 1 FROM users WHERE email = $1', [normalized]);
     if (existing) return reply.code(409).send({ error: 'email_taken' });
@@ -254,7 +260,7 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
         required: ['token', 'password'],
         properties: {
           token: { type: 'string', maxLength: 200 },
-          password: { type: 'string', minLength: 10, maxLength: 200 },
+          password: { type: 'string', minLength: PASSWORD_MIN_LENGTH, maxLength: PASSWORD_MAX_LENGTH },
         },
       },
     },
@@ -267,6 +273,10 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       [hashToken(token)],
     );
     if (!row) return reply.code(400).send({ error: 'invalid_or_expired_token' });
+    // Same strength bar as registration — a reset must not be a way to
+    // downgrade an account to a weak or breached password.
+    const weak = await checkPassword(password);
+    if (weak) return reply.code(400).send({ error: 'weak_password', detail: weak });
     const passwordHash = await hashPassword(password);
     await withTransaction(async (tx) => {
       await tx.query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, row.user_id]);

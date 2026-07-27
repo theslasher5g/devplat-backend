@@ -91,7 +91,9 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
 
   // Self-service "delete my team" — owner only, since it also wipes every
   // member's account, not just the caller's.
-  app.delete('/teams/me', { preHandler: requireMember }, async (req, reply) => {
+  // Irreversible and owner-only; the limit is a guard against a hijacked
+  // session scripting destruction, not against legitimate use.
+  app.delete('/teams/me', { preHandler: requireMember, config: { rateLimit: { max: 5, timeWindow: '1 hour' } } }, async (req, reply) => {
     if (req.membership.role !== 'owner') {
       return reply.code(403).send({ error: 'owner_required', detail: 'Only the team owner can delete the team.' });
     }
@@ -164,6 +166,10 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         },
       },
     },
+    // Each invite sends an email to an address the caller chooses, which makes
+    // this an inbox-bombing primitive if left uncapped. 20/hour is far above
+    // real onboarding (even seeding a whole team) and well below useful abuse.
+    config: { rateLimit: { max: 20, timeWindow: '1 hour' } },
   }, async (req, reply) => {
     const { email, role = 'developer' } = req.body as { email: string; role?: 'admin' | 'developer' };
     const normalized = email.trim().toLowerCase();
@@ -192,7 +198,10 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // Invite details for the accept page (no auth: the token IS the credential).
-  app.get('/invites/:token', async (req, reply) => {
+  // Unauthenticated + token-in-path means this is the one place an invite token
+  // could be guessed at, so cap attempts per IP. Tokens are high-entropy, but a
+  // limiter turns "infeasible" into "not even worth starting".
+  app.get('/invites/:token', { config: { rateLimit: { max: 30, timeWindow: '15 minutes' } } }, async (req, reply) => {
     const { token } = req.params as { token: string };
     // Deliberately not filtering on accepted_at/expires_at here — an
     // already-accepted invite (e.g. auto-accepted on email verification,
