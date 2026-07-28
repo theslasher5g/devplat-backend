@@ -35,6 +35,7 @@ export const SchedulerLock = {
   queueWorker: 1,
   healthPoller: 2,
   trialNotices: 3,
+  maintenance: 4,
 } as const;
 
 export type SchedulerLockId = (typeof SchedulerLock)[keyof typeof SchedulerLock];

@@ -72,6 +72,30 @@ export default async function webhookRoutes(app: FastifyInstance): Promise<void>
       return reply.code(400).send({ error: 'invalid_signature' });
     }
 
+    /*
+     * Replay guard. Stripe retries until it gets a 2xx — after a timeout, a
+     * deploy restart, or a 500 — so the same event id can arrive several
+     * times. The upsert handlers below survive that, but the payment_failed
+     * branch emails the customer, and nobody wants two "your payment failed"
+     * mails for one failed charge.
+     *
+     * Claiming the id before doing the work (rather than recording it after)
+     * means two concurrent deliveries of the same event can't both pass: the
+     * second INSERT conflicts and returns no row. A handler that then throws
+     * leaves the id claimed, so that event won't be retried — the trade is
+     * deliberate. A duplicate charge notice or a double-applied plan change is
+     * worse than a missed one we can see in the Stripe dashboard and replay by
+     * hand, and the log line below says exactly which id to look at.
+     */
+    const claimed = await query(
+      'INSERT INTO stripe_events (id, type) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
+      [event.id, event.type],
+    );
+    if (claimed.rowCount === 0) {
+      req.log.info({ event: event.id, type: event.type }, 'stripe webhook replay ignored');
+      return { received: true, duplicate: true };
+    }
+
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;

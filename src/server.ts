@@ -25,6 +25,7 @@ import webhookRoutes from './routes/webhooks.js';
 import { loadPlans } from './plans.js';
 import { startHealthPoller } from './scheduler/healthPoller.js';
 import { startQueueWorker } from './scheduler/queueWorker.js';
+import { startMaintenanceWorker } from './scheduler/maintenance.js';
 import { startTrialNoticeWorker } from './scheduler/trialNotices.js';
 
 /** The set of browser origins allowed to call the API with credentials: the
@@ -181,10 +182,15 @@ export async function buildServer(): Promise<FastifyInstance> {
   // Warns owners before a free trial lapses; without it the first sign is a
   // failing pipeline once parallelism drops to zero.
   const stopTrialNotices = startTrialNoticeWorker();
+  // Prunes tables that only answer questions about the recent past (sessions,
+  // spent verification tokens, the Stripe replay ledger) — nothing deleted
+  // from them before, so they grew for the life of the deployment.
+  const stopMaintenance = startMaintenanceWorker();
   app.addHook('onClose', async () => {
     stopQueueWorker();
     stopHealthPoller();
     stopTrialNotices();
+    stopMaintenance();
   });
 
   return app;

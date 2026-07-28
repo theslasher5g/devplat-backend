@@ -11,6 +11,10 @@ services:
     build: ./backend
     restart: unless-stopped
     env_file: ./backend/.env
+    # The API drains on SIGTERM (up to 20s) so a deploy doesn't sever the
+    # WebSocket tunnels carrying customers' running test suites. Docker's
+    # default grace period is 10s, which would SIGKILL mid-drain.
+    stop_grace_period: 30s
     depends_on:
       - postgres
     networks:
