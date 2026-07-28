@@ -6,8 +6,10 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { config } from './config.js';
 import { query } from './db.js';
 import { getLatestCliVersion } from './lib/cliVersion.js';
+import { captureError } from './lib/errorTracking.js';
 import adminRoutes from './routes/admin.js';
 import backupRoutes from './routes/backups.js';
+import errorRoutes from './routes/errors.js';
 import authRoutes from './routes/auth.js';
 import deviceAuthRoutes from './routes/deviceAuth.js';
 import billingRoutes from './routes/billing.js';
@@ -109,6 +111,20 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
     req.log.error({ err }, 'unhandled error');
     const clientError = typeof err.statusCode === 'number' && err.statusCode < 500;
+    if (!clientError) {
+      // Only 5xx: a 404 or a rejected password is the system working. Fire and
+      // forget so recording never delays the response, and use the route
+      // pattern rather than req.url so ids in the path don't fragment the
+      // grouping (or land in the table).
+      void captureError({
+        source: 'api',
+        message: err.message,
+        stack: err.stack,
+        route: req.routeOptions?.url ?? undefined,
+        method: req.method,
+        statusCode: 500,
+      });
+    }
     return reply.code(clientError ? err.statusCode! : 500)
       .send({ error: clientError ? err.message : 'internal_error' });
   });
@@ -171,6 +187,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(adminRoutes);
   await app.register(hostRoutes);
   await app.register(backupRoutes);
+  await app.register(errorRoutes);
   await app.register(systemHealthRoutes);
   await app.register(statusRoutes);
   await app.register(environmentRoutes);

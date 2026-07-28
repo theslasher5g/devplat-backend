@@ -40,10 +40,19 @@ export async function runMaintenance(): Promise<void> {
      WHERE processed_at < now() - interval '7 days'`,
   );
 
-  const total = (sessions.rowCount ?? 0) + (tokens.rowCount ?? 0) + (events.rowCount ?? 0);
+  // Resolved errors that haven't recurred in three months are history, not
+  // signal. Unresolved ones are never pruned — an error nobody looked at is
+  // exactly the one worth keeping.
+  const errors = await query(
+    `DELETE FROM error_events
+     WHERE resolved_at IS NOT NULL AND last_seen_at < now() - interval '90 days'`,
+  );
+
+  const total = (sessions.rowCount ?? 0) + (tokens.rowCount ?? 0) + (events.rowCount ?? 0) + (errors.rowCount ?? 0);
   if (total > 0) {
     console.log(
-      `[maintenance] pruned ${sessions.rowCount} sessions, ${tokens.rowCount} verification tokens, ${events.rowCount} stripe events`,
+      `[maintenance] pruned ${sessions.rowCount} sessions, ${tokens.rowCount} verification tokens, `
+      + `${events.rowCount} stripe events, ${errors.rowCount} resolved errors`,
     );
   }
 }
