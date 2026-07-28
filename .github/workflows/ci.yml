@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first — the older run's result
+# is about to be irrelevant anyway.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: typecheck · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Match the Dockerfile (node:22-alpine). A CI that passes on a
+          # different major than production isn't telling you much.
+          node-version: 22
+          cache: npm
+
+      # `npm ci` is what the Dockerfile runs, so a package.json edited without
+      # regenerating the lockfile fails here rather than at deploy time.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      # The tree is clean today, so anything this reports is genuinely new.
+      # It blocks rather than warns: this service holds session cookies and
+      # Stripe keys, and "we'll get to it" is how an advisory ages into an
+      # incident.
+      - run: npm audit --audit-level=high
+
+  migrations:
+    name: migrations apply cleanly
+    runs-on: ubuntu-latest
+    # Migrations run automatically when the API container starts, so a broken
+    # one doesn't fail a deploy step — it takes the API down on boot. This job
+    # applies the whole chain to an empty database, which is exactly what a
+    # fresh environment does.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: devplat
+          POSTGRES_PASSWORD: devplat
+          POSTGRES_DB: devplat
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U devplat"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://devplat:devplat@localhost:5432/devplat
+      JWT_SECRET: ci-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run migrate
+
+      # Re-running must be a no-op. If a migration isn't idempotent at the
+      # ledger level, every restart of the API would try to apply it again.
+      - name: migrations are idempotent
+        run: npm run migrate
+
+      - name: every migration file is recorded
+        run: |
+          on_disk=$(ls migrations/*.sql | wc -l)
+          applied=$(psql "$DATABASE_URL" -tAc 'SELECT count(*) FROM schema_migrations')
+          echo "on disk: $on_disk, applied: $applied"
+          test "$on_disk" -eq "$applied"
