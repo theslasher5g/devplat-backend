@@ -4,7 +4,7 @@ import { maybeOne, one, query, withTransaction } from '../db.js';
 import { getPlan, maxFootprintGb } from '../plans.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { AUDIT_CSV_HEADER, auditCsvRow, auditFilters } from '../lib/auditExport.js';
-import { sendTeamInviteEmail } from '../lib/email.js';
+import { sendTeamInviteEmail, sendTwoFactorRequiredEmail } from '../lib/email.js';
 import { getOrCreateReferralCode } from '../lib/referral.js';
 import { stripe } from '../lib/stripe.js';
 import { notifyOwnershipTransferred } from '../lib/securityEvents.js';
@@ -283,9 +283,50 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         });
       }
     }
-    await query('UPDATE teams SET require_two_factor = $1 WHERE id = $2', [requireTwoFactor, req.membership.teamId]);
+
+    // Flip it and report whether this was an actual change, in one statement —
+    // so a second PATCH with the same value can't re-notify anyone. Saving a
+    // settings form twice must not mail the whole team twice.
+    //
+    // The `FROM teams prev` self-join is what makes that possible: RETURNING
+    // sees the *new* row, so comparing against it would always look like a
+    // change. The join captures the pre-update snapshot instead.
+    const updated = await one<{ team_name: string; changed: boolean }>(
+      `UPDATE teams t SET require_two_factor = $1
+       FROM teams prev
+       WHERE t.id = $2 AND prev.id = t.id
+       RETURNING t.name AS team_name, (prev.require_two_factor IS DISTINCT FROM $1) AS changed`,
+      [requireTwoFactor, req.membership.teamId],
+    );
     await auditFromReq(req, requireTwoFactor ? 'team.2fa_required' : 'team.2fa_optional', { target: req.user.email });
-    return { ok: true, requireTwoFactor };
+
+    let notified = 0;
+    if (requireTwoFactor && updated.changed) {
+      // Tell the people this actually affects, now — otherwise the first sign
+      // is a dashboard that stops working mid-task, with no idea what changed
+      // or who changed it. Unverified addresses are skipped: mailing an
+      // address nobody has proved they own is how a service becomes a spam
+      // vector.
+      const pending = await query<{ email: string }>(
+        `SELECT u.email FROM team_members tm
+         JOIN users u ON u.id = tm.user_id
+         WHERE tm.team_id = $1
+           AND u.totp_enabled_at IS NULL
+           AND u.email_verified_at IS NOT NULL`,
+        [req.membership.teamId],
+      );
+      // Settled, not sequential: one bad address must not stop the rest, and
+      // awaiting them means the response only claims what actually happened.
+      const results = await Promise.allSettled(
+        pending.rows.map((m) => sendTwoFactorRequiredEmail(m.email, updated.team_name, req.user.email)),
+      );
+      notified = results.filter((r) => r.status === 'fulfilled').length;
+      for (const r of results) {
+        if (r.status === 'rejected') req.log.warn({ err: r.reason }, '2FA-required notice could not be sent');
+      }
+    }
+
+    return { ok: true, requireTwoFactor, notified };
   });
 
   // Who on the team still needs to enrol — so an owner can chase people rather

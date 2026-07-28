@@ -8,6 +8,7 @@ import PaymentFailed from '../emails/PaymentFailed.js';
 import ResetPassword from '../emails/ResetPassword.js';
 import SecurityAlert from '../emails/SecurityAlert.js';
 import TrialEnding from '../emails/TrialEnding.js';
+import TwoFactorRequired from '../emails/TwoFactorRequired.js';
 import StatusConfirm from '../emails/StatusConfirm.js';
 import StatusNotify from '../emails/StatusNotify.js';
 import TeamInvite from '../emails/TeamInvite.js';
@@ -67,6 +68,22 @@ export async function sendTeamInviteEmail(
 ): Promise<void> {
   const inviteUrl = `${config.frontendUrl}/invite?token=${token}`;
   await send(to, `Invitation: join ${teamName} on devplat`, TeamInvite({ inviteUrl, teamName, inviterEmail, role }), inviteUrl);
+}
+
+/**
+ * Tells a member their team now requires two-factor, before they discover it
+ * as a dashboard that stopped working.
+ */
+export async function sendTwoFactorRequiredEmail(
+  to: string, teamName: string, ownerEmail: string,
+): Promise<void> {
+  const profileUrl = `${config.frontendUrl}/app/profile`;
+  await send(
+    to,
+    `Action needed: ${teamName} now requires two-factor authentication`,
+    TwoFactorRequired({ teamName, ownerEmail, profileUrl }),
+    profileUrl,
+  );
 }
 
 export async function sendStatusConfirmEmail(to: string, token: string): Promise<void> {
