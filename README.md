@@ -3,10 +3,12 @@
 Control-plane API for [devplat](https://devplat.ch) — the remote backend for
 Testcontainers. Node.js + TypeScript + Fastify + Postgres.
 
-Covers: auth (JWT session cookie), email verification & password reset via
-Resend (React Email templates), teams/roles/invites, API tokens, Stripe
-subscriptions (Checkout + Customer Portal + webhook), plan limits for the
-future scheduler, and platform-admin endpoints for `/admin`.
+Covers: auth (JWT session cookie, TOTP two-factor, session inventory), email
+verification & password reset via Resend (React Email templates),
+teams/roles/invites/multi-team membership, API tokens (expiry + IP
+allowlists), the environment scheduler, Stripe subscriptions (Checkout +
+Customer Portal + webhook), audit logging with CSV/JSON export, and
+platform-admin endpoints for `/admin`.
 
 ## Local development
 
@@ -39,13 +41,21 @@ and prints the six `STRIPE_PRICE_*` env lines. Then point a webhook at
 
 | Area | Endpoints |
 |---|---|
-| Auth | `POST /auth/register` `POST /auth/login` `POST /auth/logout` `GET /auth/me` `POST /auth/verify-email` `POST /auth/resend-verification` `POST /auth/forgot-password` `POST /auth/reset-password` |
-| Teams | `GET /teams/me` `PATCH /teams/me` `POST /teams/me/invites` `GET /invites/:token` `POST /invites/:token/accept` `PATCH/DELETE /teams/me/members/:userId` |
+| Auth | `POST /auth/register` `POST /auth/login` `POST /auth/logout` `GET /auth/me` `POST /auth/verify-email` `POST /auth/resend-verification` `POST /auth/forgot-password` `POST /auth/reset-password` `POST /auth/change-password` `POST /auth/change-email(/confirm)` `DELETE /auth/me` |
+| Two-factor | `GET /auth/2fa` `POST /auth/2fa/setup` `POST /auth/2fa/enable` `POST /auth/2fa/disable` |
+| Sessions | `GET /auth/sessions` `DELETE /auth/sessions/:id` `POST /auth/sessions/revoke-others` |
+| Device login | `POST /auth/device/start` `POST /auth/device/token` (both unauthenticated) `POST /auth/device/approve` |
+| Teams | `GET /teams` `POST /teams` `POST /teams/switch` `GET/PATCH/DELETE /teams/me` `POST /teams/me/invites` `DELETE /teams/me/invites/:id` `GET /invites/:token` `POST /invites/:token/accept` `PATCH/DELETE /teams/me/members/:userId` `POST /teams/me/leave` `POST /teams/me/transfer-ownership` |
+| Team security | `GET/PATCH /teams/me/security` (team-wide 2FA requirement) |
+| Audit | `GET /teams/me/audit` `GET /teams/me/audit/actions` `GET /teams/me/audit/export?format=csv\|json` |
+| Environments | `POST /environments` `GET /environments(/:id)` `DELETE /environments/:id` `GET /environments/:id/tunnel(/:port)` `GET /environments/:id/containers` `GET /environments/history` `GET /environments/usage` |
 | Scheduler | `GET /teams/:id/limits` (session **or** `Authorization: Bearer dvp_…` API token) |
-| API tokens | `GET/POST /tokens` `DELETE /tokens/:id` (plaintext returned exactly once on create) |
+| API tokens | `GET/POST /tokens` `DELETE /tokens/:id` (plaintext returned exactly once on create; optional `expiresInDays` + `ipAllowlist`) |
 | Billing | `GET /billing/subscription` `POST /billing/checkout` `POST /billing/portal` `GET /billing/invoices` |
+| Account | `GET /account/export` (GDPR Art. 15/20) |
+| Public | `GET /status` `POST /status/subscribe` `GET /cli/latest-version` `GET /promo` `POST /contact` |
 | Webhooks | `POST /webhooks/stripe` (signature-verified, raw body) |
-| Admin | `GET /admin/overview` `GET /admin/hosts` `GET /admin/subscribers` (requires `users.is_platform_admin`) |
+| Admin | `GET /admin/overview` `GET /admin/hosts` `GET /admin/subscribers` `GET /admin/system` `GET /admin/audit` `GET /admin/timeseries` … (all require `users.is_platform_admin`) |
 
 Sessions are httpOnly cookies (`devplat_session`, SameSite=Lax, shared across
 `.devplat.ch`); `Authorization: Bearer <jwt>` works too. Team roles:
@@ -55,6 +65,64 @@ owner/admin. Platform admin is a separate per-user flag:
 ```sql
 UPDATE users SET is_platform_admin = true WHERE email = 'you@devplat.dev';
 ```
+
+## Auth and account security
+
+**Passwords** (`src/lib/passwordPolicy.ts`) must be 12–200 characters with an
+upper- and lowercase letter, a digit, and a special character, and are checked
+against Have I Been Pwned's breach corpus over the k-anonymity range API — only
+the first five characters of the SHA-1 hash ever leave the process, and the
+check fails open if HIBP is unreachable. Enforced server-side on registration,
+reset and change; the frontend mirrors the rules for live feedback only.
+
+**Two-factor** is TOTP (RFC 6238), implemented directly on `node:crypto` in
+`src/lib/totp.ts` — no dependency, and covered by the published test vectors in
+`test/totp.test.ts`. Enrolment returns an `otpauth://` URI (rendered as a QR
+code in the dashboard) plus ten single-use recovery codes, stored hashed. Codes
+are accepted within ±1 step of clock skew, and the matched step is recorded so
+the same code can't be replayed.
+
+A team owner can require 2FA for the whole team (`PATCH /teams/me/security`).
+That check lives in `requireMember`, deliberately **not** in `requireUser`: a
+member who hasn't enrolled yet must still be able to reach their own profile to
+do so, they just can't touch team resources until they have.
+
+**Sessions** carry a `sid` claim backed by a `user_sessions` row, so
+`GET /auth/sessions` can list active devices and `DELETE /auth/sessions/:id`
+can drop one. `users.sessions_valid_from` is a cut-off compared against each
+token's `iat` — bumping it (password change, 2FA disable) invalidates every
+token issued before that moment in one write.
+
+**Security event emails** (`src/lib/securityEvents.ts`) notify on sign-in from
+an unrecognised device (hashed user-agent + /24 prefix; the first device is
+silent, since everyone has a first device), token creation, 2FA being disabled,
+password change and ownership transfer.
+
+**API tokens** may carry an expiry and an IP allowlist. Matching is done in
+Postgres with native `inet`/`cidr` and the `<<=` containment operator, so
+subnet arithmetic isn't reimplemented in JS; `src/lib/cidr.ts` only validates
+input before it reaches the database. Rejections use distinct error codes
+(`api_token_expired`, `ip_not_allowed`, `two_factor_required`,
+`seat_limit_reached`, …) that the CLI turns into command-specific advice.
+
+## Background jobs
+
+The queue worker, health poller and trial-notice sweep each run under a
+Postgres advisory lock (`src/lib/advisoryLock.ts`), so exactly one instance
+executes a given tick even with multiple replicas or during a rolling deploy.
+`pg_try_advisory_lock` is non-blocking — a losing instance skips that tick
+rather than queueing a backlog — and the lock is released with the connection,
+so a killed instance can't wedge the scheduler.
+
+## Tests
+
+```bash
+npm test        # node:test, no database required
+```
+
+Covers the pure-logic pieces where a silent regression is expensive: TOTP
+against the RFC 6238 vectors, the password policy and HIBP lookup (with `fetch`
+stubbed), CIDR validation, and audit-export filter parsing and CSV escaping.
 
 ## Deployment on the VPS
 
