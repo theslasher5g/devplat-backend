@@ -146,6 +146,13 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         vcpuPerEnv: getPlan(team.plan_tier).vcpuPerEnv,
         ramGbPerEnv: getPlan(team.plan_tier).ramMbPerEnv / 1024,
         maxFootprintGb: maxFootprintGb(getPlan(team.plan_tier)),
+        // Seat cap, and how much of it is already committed. Sent so the UI
+        // can say "Solo is a single-seat plan" up front instead of offering an
+        // invite form whose only possible outcome is an error — the server
+        // still enforces this (seatLimitError), this is just so the client
+        // doesn't have to guess.
+        maxMembers: getPlan(team.plan_tier).maxMembers,
+        seatsUsed: (members.rowCount ?? 0) + (invites.rowCount ?? 0),
         trialEndsAt: team.trial_ends_at,
         createdAt: team.created_at,
         myRole: req.membership.role,
