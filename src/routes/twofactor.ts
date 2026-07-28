@@ -5,7 +5,7 @@ import { verifyPassword } from '../lib/passwords.js';
 import { hashToken } from '../lib/tokens.js';
 import { generateRecoveryCodes, generateSecret, otpauthUri, verifyTotp } from '../lib/totp.js';
 import { establishSession, requireUser, revokeSessions } from '../plugins/auth.js';
-import { notifyTwoFactorDisabled } from '../lib/securityEvents.js';
+import { notifyRecoveryCodesRegenerated, notifyTwoFactorDisabled } from '../lib/securityEvents.js';
 
 /**
  * TOTP two-factor enrolment and removal. The pattern throughout: a secret that
@@ -86,6 +86,54 @@ export default async function twoFactorRoutes(app: FastifyInstance): Promise<voi
     await auditFromReq(req, '2fa.enable', { target: req.user.email });
     await establishSession(req, reply);
     return reply.code(201).send({ ok: true, recoveryCodes: codes });
+  });
+
+  /*
+   * Issue a fresh set of ten recovery codes, invalidating whatever remained of
+   * the old set.
+   *
+   * Codes were previously only ever handed out once, at enrolment — there was
+   * no way to top back up after using several, short of disabling and
+   * re-enabling 2FA (itself only possible with a code or a code you no longer
+   * have much margin on). Someone down to their last one or two had no way to
+   * get back to a comfortable margin without already being in the situation
+   * this is meant to prevent.
+   *
+   * Requires a current TOTP code rather than the password: this proves you
+   * still hold the working authenticator, which is exactly the condition under
+   * which handing out a fresh safety net (and burning the old one) is safe.
+   */
+  app.post('/auth/2fa/recovery-codes/regenerate', {
+    preHandler: requireUser,
+    schema: {
+      body: { type: 'object', required: ['code'], properties: { code: { type: 'string', maxLength: 20 } } },
+    },
+    config: { rateLimit: { max: 10, timeWindow: '15 minutes' } },
+  }, async (req, reply) => {
+    const { code } = req.body as { code: string };
+    const row = await one<{ totp_secret: string | null; totp_enabled_at: string | null }>(
+      'SELECT totp_secret, totp_enabled_at FROM users WHERE id = $1', [req.user.id],
+    );
+    if (!row.totp_enabled_at || !row.totp_secret) {
+      return reply.code(400).send({ error: 'not_enabled', detail: 'Two-factor authentication is not enabled on this account.' });
+    }
+    if (!verifyTotp(row.totp_secret, code).ok) {
+      return reply.code(400).send({ error: 'invalid_totp', detail: 'That code is not valid — check your device clock and try the current code.' });
+    }
+
+    const codes = generateRecoveryCodes();
+    await withTransaction(async (tx) => {
+      await tx.query('DELETE FROM two_factor_recovery_codes WHERE user_id = $1', [req.user.id]);
+      for (const c of codes) {
+        await tx.query(
+          'INSERT INTO two_factor_recovery_codes (user_id, code_hash) VALUES ($1, $2)',
+          [req.user.id, hashToken(c)],
+        );
+      }
+    });
+    await auditFromReq(req, '2fa.recovery_codes_regenerated', { target: req.user.email });
+    notifyRecoveryCodesRegenerated(req, req.user.email);
+    return { ok: true, recoveryCodes: codes };
   });
 
   // Turning 2FA off is a downgrade of the account's security, so it needs the

@@ -107,3 +107,31 @@ export function notifyOwnershipTransferred(req: FastifyRequest, email: string, t
   notifyAsync(req, email, `Ownership of ${teamName} was transferred`,
     `You are no longer the owner of ${teamName} — ${newOwner} is. You remain an admin, but billing and ownership now sit with them.`);
 }
+
+export function notifyRecoveryCodesRegenerated(req: FastifyRequest, email: string): void {
+  notifyAsync(req, email, 'Your two-factor recovery codes were regenerated',
+    'A new set of ten recovery codes was issued for your account. Every code from the previous set — used or not — stopped working.');
+}
+
+/**
+ * Support reset a locked-out account's two-factor, rather than the user's own
+ * action — so this deliberately does NOT reuse notify()/notifyAsync(), which
+ * describe the *caller's* device and IP via describeClient(req). That's the
+ * admin's browser here, not the account owner's, and showing it in a mail to
+ * the owner would misleadingly read as "your device did this" while also
+ * exposing the admin's IP address to an arbitrary customer for no reason.
+ *
+ * If this wasn't actually requested by the account owner, this line is what
+ * lets them notice a support channel was misused — so it says who can act on
+ * it, not just what changed.
+ */
+export function notifyTwoFactorResetByAdmin(email: string): void {
+  void sendSecurityAlertEmail(email, {
+    headline: 'Two-factor authentication was reset on your account',
+    detail: 'A devplat administrator reset two-factor authentication on your account, typically after a support '
+      + 'request for a lost device. It is now off — sign in with your password and set it up again from your profile.',
+    whenText: new Date().toUTCString(),
+    contextLines: ['If you did not request this, contact support immediately — someone with access to your account may have.'],
+    profileUrl: `${config.frontendUrl}/app/profile`,
+  }).catch((err) => console.error('[security] 2FA-reset-by-admin alert could not be sent', err));
+}

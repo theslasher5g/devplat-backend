@@ -1,10 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { config, type PlanTier } from '../config.js';
 import { getPlan } from '../plans.js';
-import { query, withTransaction } from '../db.js';
+import { maybeOne, query, withTransaction } from '../db.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
+import { notifyTwoFactorResetByAdmin } from '../lib/securityEvents.js';
 import { stripe } from '../lib/stripe.js';
-import { requirePlatformAdmin } from '../plugins/auth.js';
+import { requirePlatformAdmin, revokeSessions } from '../plugins/auth.js';
 
 /** Best-effort cancel of a team's Stripe subscription before the team row is
  *  deleted, so removing a paying team doesn't leave it billing in Stripe.
@@ -243,9 +244,10 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     const like = `%${q}%`;
     const res = await query<{
       id: string; email: string; email_verified_at: string | null; is_platform_admin: boolean;
-      created_at: string; teams: { teamId: string; teamName: string; role: string }[] | null;
+      created_at: string; two_factor_enabled: boolean; teams: { teamId: string; teamName: string; role: string }[] | null;
     }>(
       `SELECT u.id, u.email, u.email_verified_at, u.is_platform_admin, u.created_at,
+              (u.totp_enabled_at IS NOT NULL) AS two_factor_enabled,
               COALESCE(
                 (SELECT json_agg(json_build_object('teamId', t.id, 'teamName', t.name, 'role', tm.role)
                                  ORDER BY tm.created_at)
@@ -263,10 +265,52 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         email: u.email,
         verified: u.email_verified_at !== null,
         isPlatformAdmin: u.is_platform_admin,
+        twoFactorEnabled: u.two_factor_enabled,
         createdAt: u.created_at,
         teams: u.teams ?? [],
       })),
     };
+  });
+
+  /*
+   * Reset a locked-out user's two-factor authentication.
+   *
+   * Before this there was no way back for someone who lost their authenticator
+   * AND their recovery codes: self-service disable needs a current TOTP code
+   * or an unused recovery code, and nothing — not even a platform admin —
+   * could clear totp_enabled_at any other way. "I lost my phone and my
+   * recovery codes" was a support ticket with no answer short of a manual
+   * database update.
+   *
+   * This only clears the second factor; it does not re-enable anything or
+   * hand out new codes; the user signs in with their password and re-enrols
+   * from their own profile afterward. Sessions are revoked for the same reason
+   * disabling 2FA yourself revokes them — the state just got weaker, so
+   * anything already authenticated under the old, stronger guarantee shouldn't
+   * silently keep riding on it.
+   */
+  app.post('/admin/users/:id/reset-2fa', { preHandler: requirePlatformAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const target = await maybeOne<{ email: string; totp_enabled_at: string | null }>(
+      'SELECT email, totp_enabled_at FROM users WHERE id = $1', [id],
+    );
+    if (!target) return reply.code(404).send({ error: 'not_found' });
+    if (!target.totp_enabled_at) {
+      return reply.code(400).send({ error: 'not_enabled', detail: 'This account does not have two-factor authentication enabled.' });
+    }
+
+    await withTransaction(async (tx) => {
+      await tx.query(
+        'UPDATE users SET totp_secret = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = $1', [id],
+      );
+      await tx.query('DELETE FROM two_factor_recovery_codes WHERE user_id = $1', [id]);
+    });
+    await revokeSessions(id);
+    await auditFromReq(req, '2fa.admin_reset', { teamId: null, target: target.email, detail: { userId: id } });
+    // Told regardless of Resend's own outcome — see notifyTwoFactorResetByAdmin
+    // for why this deliberately isn't the same helper self-triggered events use.
+    notifyTwoFactorResetByAdmin(target.email);
+    return { ok: true };
   });
 
   // Delete a user. Deleting a platform admin (including yourself) is refused so
