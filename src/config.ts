@@ -36,6 +36,11 @@ export const config = {
   // set, gets the same alert. Both channels are best-effort.
   opsAlertEmail: process.env.OPS_ALERT_EMAIL ?? process.env.CONTACT_EMAIL ?? 'hello@devplat.ch',
   slackAlertWebhookUrl: process.env.SLACK_ALERT_WEBHOOK_URL ?? '',
+  // Shared secret the backup script authenticates its run reports with
+  // (deploy/backup/backup.sh). Empty disables reporting entirely, which
+  // also disables the "backups have gone quiet" alert — so an unset value
+  // is reported as unconfigured in the admin dashboard rather than as OK.
+  backupReportToken: process.env.BACKUP_REPORT_TOKEN ?? '',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? '',
   stripePrices: {

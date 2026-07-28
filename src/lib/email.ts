@@ -27,6 +27,23 @@ async function send(to: string, subject: string, element: ReactElement, actionUr
   if (error) throw new Error(`Resend error: ${error.message}`);
 }
 
+/**
+ * Plain-text ops mail. The customer-facing mails are React Email templates
+ * because they're brand surface; an alert that only you and I ever read is
+ * better served by text that can't break rendering — and by not needing a new
+ * template component every time there's a new thing worth alerting on.
+ */
+export async function sendOpsEmail(subject: string, body: string): Promise<void> {
+  if (!resend) {
+    console.warn(`[email] RESEND_API_KEY not set — would send ops mail "${subject}":\n${body}`);
+    return;
+  }
+  const { error } = await resend.emails.send({
+    from: config.emailFrom, to: config.opsAlertEmail, subject, text: body,
+  });
+  if (error) throw new Error(`Resend error: ${error.message}`);
+}
+
 export async function sendVerificationEmail(to: string, token: string): Promise<void> {
   const verifyUrl = `${config.frontendUrl}/verify-email?token=${token}`;
   await send(to, 'Confirm your email address — devplat', VerifyEmail({ verifyUrl }), verifyUrl);

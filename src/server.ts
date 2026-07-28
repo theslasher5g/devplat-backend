@@ -7,6 +7,7 @@ import { config } from './config.js';
 import { query } from './db.js';
 import { getLatestCliVersion } from './lib/cliVersion.js';
 import adminRoutes from './routes/admin.js';
+import backupRoutes from './routes/backups.js';
 import authRoutes from './routes/auth.js';
 import deviceAuthRoutes from './routes/deviceAuth.js';
 import billingRoutes from './routes/billing.js';
@@ -169,6 +170,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(webhookRoutes);
   await app.register(adminRoutes);
   await app.register(hostRoutes);
+  await app.register(backupRoutes);
   await app.register(systemHealthRoutes);
   await app.register(statusRoutes);
   await app.register(environmentRoutes);

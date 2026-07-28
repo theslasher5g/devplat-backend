@@ -1,0 +1,47 @@
+; Infomaniak Swiss Backup — rclone remote for the devplat VPS.
+;
+; You do NOT write this file from scratch. Infomaniak emails you a ready-made
+; rclone.conf when you add the device in the Manager; this file only shows what
+; that one looks like and marks the two things you have to touch.
+;
+; Install it at  /root/.config/rclone/rclone.conf  (root, because cron runs the
+; backup as root). If the file already exists, append this section rather than
+; replacing it. Then lock it down:
+;
+;     mkdir -p /root/.config/rclone
+;     chmod 700 /root/.config/rclone
+;     chmod 600 /root/.config/rclone/rclone.conf
+;
+; Check rclone agrees with you:
+;
+;     rclone config          # the remote should be listed
+;     rclone lsd swissbackup:
+;
+; ── CHANGE 1 ────────────────────────────────────────────────────────────────
+; The section name. Infomaniak's file calls it [sb_project_SBI-XX000000].
+; Rename it to [swissbackup] so every command reads cleanly — the name is
+; arbitrary, it just has to match RCLONE_REMOTE in backup.env.
+[swissbackup]
+
+type = swift
+
+; ── Leave exactly as Infomaniak sent them ──────────────────────────────────
+; user and tenant are your device's identifiers; the auth URL's cluster number
+; (swiss-backup02 / 03 / …) is whatever the Manager shows under "Standort" for
+; your device. Devices created before October 2020 use the unnumbered host,
+; https://swiss-backup.infomaniak.com/identity/v3 — again, take what you were
+; sent rather than what looks right.
+user = SBI-XX000000
+auth = https://swiss-backup02.infomaniak.com/identity/v3
+domain = default
+tenant = sb_project_SBI-XX000000
+tenant_domain = default
+region = RegionOne
+storage_url =
+auth_version =
+
+; ── CHANGE 2 ────────────────────────────────────────────────────────────────
+; Replace [password] with the password generated for the device in the Manager
+; (Swiss Backup → your device → credentials). It is stored here in clear, which
+; is why the file must be 0600 and owned by root.
+key = [password]

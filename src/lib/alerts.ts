@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { sendHostOfflineEmail } from './email.js';
+import { sendHostOfflineEmail, sendOpsEmail } from './email.js';
 
 /** Fan an ops alert out to every configured channel. Each channel is
  *  independent and best-effort: one failing (Resend down, Slack webhook 500)
@@ -34,5 +34,24 @@ export async function sendHostOfflineAlert(host: {
   ]);
   for (const r of results) {
     if (r.status === 'rejected') console.error('[alerts] host-offline channel failed', r.reason);
+  }
+}
+
+/**
+ * Generic ops alert: email plus Slack, same best-effort fan-out as above.
+ * `emoji` only affects the Slack line; the mail carries the subject and body
+ * as written.
+ */
+export async function sendOpsAlert(
+  subject: string,
+  body: string,
+  emoji = ':warning:',
+): Promise<void> {
+  const results = await Promise.allSettled([
+    sendOpsEmail(`[devplat ops] ${subject}`, body),
+    postSlack(`${emoji} *${subject}*\n${body}`),
+  ]);
+  for (const r of results) {
+    if (r.status === 'rejected') console.error('[alerts] ops-alert channel failed', r.reason);
   }
 }
