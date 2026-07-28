@@ -3,6 +3,7 @@ import { config, type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { getPlan, maxFootprintGb } from '../plans.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
+import { AUDIT_CSV_HEADER, auditCsvRow, auditFilters } from '../lib/auditExport.js';
 import { sendTeamInviteEmail } from '../lib/email.js';
 import { getOrCreateReferralCode } from '../lib/referral.js';
 import { stripe } from '../lib/stripe.js';
@@ -41,48 +42,6 @@ async function seatLimitError(
       + `(${counts.members} member${counts.members === '1' ? '' : 's'}, ${counts.invites} pending invite${counts.invites === '1' ? '' : 's'}). `
       + 'Upgrade the plan to add more people.',
   };
-}
-
-/** Parses the audit list/export query into safe, parameterised filter values.
- *  Everything is nullable so a single SQL statement handles every combination
- *  via `($n IS NULL OR ...)` rather than string-building a WHERE clause. */
-function auditFilters(q: Record<string, string | undefined>): {
-  from: string | null; to: string | null; action: string | null; actorLike: string | null;
-  limit: number; offset: number;
-} {
-  const date = (v: string | undefined): string | null => {
-    if (!v) return null;
-    const t = Date.parse(v);
-    return Number.isFinite(t) ? new Date(t).toISOString() : null;
-  };
-  const num = (v: string | undefined, def: number, max: number): number => {
-    const n = Number(v);
-    return Number.isFinite(n) && n >= 0 ? Math.min(Math.trunc(n), max) : def;
-  };
-  const actor = q.actor?.trim();
-  return {
-    from: date(q.from),
-    to: date(q.to),
-    action: q.action?.trim() || null,
-    // ILIKE with wrapped wildcards: an operator searching "@acme.com" should
-    // match every address at that domain.
-    actorLike: actor ? `%${actor}%` : null,
-    limit: num(q.limit, 50, 200),
-    offset: num(q.offset, 0, 100_000),
-  };
-}
-
-/** ISO 8601 for export columns, whatever the driver handed us. */
-function isoTimestamp(value: unknown): string {
-  if (value instanceof Date) return value.toISOString();
-  const parsed = Date.parse(String(value));
-  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : String(value);
-}
-
-/** RFC 4180 cell: quote when needed, and double any embedded quotes. */
-function csvCell(value: string): string {
-  const s = String(value ?? '');
-  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 export default async function teamRoutes(app: FastifyInstance): Promise<void> {
@@ -285,18 +244,11 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         .header('content-disposition', `attachment; filename="devplat-audit-${stamp}.json"`)
         .send(JSON.stringify({ exportedAt: new Date().toISOString(), entries }, null, 2));
     }
-    const header = 'timestamp,action,actor,target,detail\n';
-    const body = entries.map((e) => [
-      // node-postgres hands back a Date for timestamptz; JSON.stringify would
-      // render that as ISO but String() gives "Mon Jul 27 2026 …", which no
-      // spreadsheet sorts correctly. Normalise explicitly.
-      isoTimestamp(e.createdAt),
-      e.action, e.actorEmail ?? '', e.target ?? '', JSON.stringify(e.detail ?? {}),
-    ].map(csvCell).join(',')).join('\n');
+    const body = entries.map(auditCsvRow).join('\n');
     return reply
       .header('content-type', 'text/csv; charset=utf-8')
       .header('content-disposition', `attachment; filename="devplat-audit-${stamp}.csv"`)
-      .send(header + body + (body ? '\n' : ''));
+      .send(AUDIT_CSV_HEADER + body + (body ? '\n' : ''));
   });
 
   // Team security policy. Requiring 2FA is owner-only: it can lock members out
