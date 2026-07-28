@@ -1,5 +1,6 @@
 import { type PlanTier } from '../config.js';
 import { query } from '../db.js';
+import { SchedulerLock, lockedTick } from '../lib/advisoryLock.js';
 import { getPlan } from '../plans.js';
 import { reclaimStaleAssignments, tryAssign } from './allocator.js';
 
@@ -46,8 +47,9 @@ export async function processQueue(): Promise<void> {
 }
 
 export function startQueueWorker(intervalMs: number): () => void {
-  const timer = setInterval(() => {
-    processQueue().catch((err) => console.error('[scheduler] queue worker tick failed', err));
-  }, intervalMs);
+  // Advisory-locked: two instances assigning from the same queue would each
+  // read a team's running count before the other's assignment landed, letting
+  // a team exceed its parallel-environment limit. See lib/advisoryLock.ts.
+  const timer = setInterval(lockedTick('queue worker', SchedulerLock.queueWorker, processQueue), intervalMs);
   return () => clearInterval(timer);
 }

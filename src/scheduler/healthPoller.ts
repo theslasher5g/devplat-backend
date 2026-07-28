@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { query } from '../db.js';
+import { SchedulerLock, lockedTick } from '../lib/advisoryLock.js';
 import { sendHostOfflineAlert } from '../lib/alerts.js';
 import { recordComponentStatuses } from '../lib/status.js';
 import { clientForHost } from './agentClient.js';
@@ -64,13 +65,16 @@ export async function pollHostHealth(): Promise<void> {
 }
 
 export function startHealthPoller(intervalMs: number): () => void {
-  const timer = setInterval(() => {
-    // Reconcile host health first, then snapshot any derived-status change into
-    // the status history. Chained so the recording sees the freshly-updated
-    // hosts.status; both failures are logged, neither stops the interval.
-    pollHostHealth()
-      .then(() => recordComponentStatuses())
-      .catch((err) => console.error('[scheduler] health poll tick failed', err));
-  }, intervalMs);
+  // Reconcile host health first, then snapshot any derived-status change into
+  // the status history. Chained so the recording sees the freshly-updated
+  // hosts.status. Advisory-locked so N instances don't poll every agent N
+  // times per interval and write N status-history rows for one transition.
+  const timer = setInterval(
+    lockedTick('health poll', SchedulerLock.healthPoller, async () => {
+      await pollHostHealth();
+      await recordComponentStatuses();
+    }),
+    intervalMs,
+  );
   return () => clearInterval(timer);
 }

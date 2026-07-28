@@ -1,4 +1,5 @@
 import { query } from '../db.js';
+import { SchedulerLock, lockedTick } from '../lib/advisoryLock.js';
 import { sendTrialEndingEmail } from '../lib/email.js';
 
 /**
@@ -46,9 +47,10 @@ export async function sendTrialNotices(): Promise<void> {
 /** Runs the sweep on an interval. Hourly is plenty for a daily-granularity
  *  notice and keeps the query cost negligible. */
 export function startTrialNoticeWorker(intervalMs = 3_600_000): () => void {
-  const tick = () => {
-    sendTrialNotices().catch((err) => console.error('[trial-notices] sweep failed', err));
-  };
+  // Advisory-locked, and this one matters most: the milestone is recorded only
+  // after the mail is sent, so two instances sweeping at once would both see
+  // the team as un-notified and the owner would get the warning twice.
+  const tick = lockedTick('trial-notices', SchedulerLock.trialNotices, sendTrialNotices);
   tick(); // once at startup so a restart doesn't delay overdue notices
   const timer = setInterval(tick, intervalMs);
   return () => clearInterval(timer);
