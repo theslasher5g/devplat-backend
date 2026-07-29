@@ -31,13 +31,28 @@ export async function pollHostHealth(): Promise<void> {
       // COALESCE so a poll that couldn't read cache stats keeps the last known
       // counters rather than nulling them. A healthy poll also clears any open
       // offline alert, so a future outage re-alerts (see below).
+      // Measured usage rides along on the same COALESCE discipline as the
+      // cache counters (see migration 035): absent stays absent rather than
+      // becoming a zero that would make an unmeasured host look idle.
+      const u = health.usage;
       await query(
         `UPDATE hosts SET status = $1, cpu_used = $2, ram_used_mb = $3, last_heartbeat = now(),
                 cache_lookups = COALESCE($4, cache_lookups), cache_hits = COALESCE($5, cache_hits),
+                ram_committed_mb = COALESCE($6, ram_committed_mb),
+                ram_granted_mb = COALESCE($7, ram_granted_mb),
+                ram_guest_used_mb = COALESCE($8, ram_guest_used_mb),
+                ram_host_available_mb = COALESCE($9, ram_host_available_mb),
+                cpu_busy_pct = COALESCE($10, cpu_busy_pct),
+                cpu_used_actual = COALESCE($11, cpu_used_actual),
+                cpu_throttled_vms = COALESCE($12, cpu_throttled_vms),
+                usage_reported_at = CASE WHEN $13 THEN now() ELSE usage_reported_at END,
                 offline_alerted_at = NULL
-         WHERE id = $6`,
+         WHERE id = $14`,
         [health.draining ? 'draining' : 'online', health.cpuUsed, health.ramUsedMb,
-          health.cacheLookups ?? null, health.cacheHits ?? null, host.id],
+          health.cacheLookups ?? null, health.cacheHits ?? null,
+          u?.ramCommittedMb ?? null, u?.ramGrantedMb ?? null, u?.ramGuestUsedMb ?? null,
+          u?.ramHostAvailableMb ?? null, u?.cpuBusyPct ?? null, u?.cpuUsedActual ?? null,
+          u?.cpuThrottledVms ?? null, u !== undefined, host.id],
       );
     } catch {
       const staleSeconds = host.last_heartbeat

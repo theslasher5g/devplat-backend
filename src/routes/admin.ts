@@ -3,6 +3,8 @@ import { config, type PlanTier } from '../config.js';
 import { getPlan } from '../plans.js';
 import { maybeOne, query, withTransaction } from '../db.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
+import { HOST_USAGE_COLUMNS, type HostUsageColumns, presentHostUsage } from '../lib/hostUsage.js';
+import { clientForHost } from '../scheduler/agentClient.js';
 import { notifyTwoFactorResetByAdmin } from '../lib/securityEvents.js';
 import { stripe } from '../lib/stripe.js';
 import { requirePlatformAdmin, revokeSessions } from '../plugins/auth.js';
@@ -37,7 +39,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       id: string; name: string; location: string; cpu_total: number; ram_total_mb: number;
       cpu_used: number; ram_used_mb: number; status: string; drain: boolean; last_heartbeat: string | null;
       vms: string;
-    }>(
+    } & HostUsageColumns>(
       `SELECT h.*,
               (SELECT count(*) FROM environment_requests er
                  WHERE er.host_id = h.id AND er.status = 'assigned') AS vms
@@ -52,8 +54,13 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         drain: h.drain,
         vms: Number(h.vms),
         lastHeartbeat: h.last_heartbeat,
+        // Committed: the sum of plan promises, which is what the scheduler
+        // admits against. Deliberately kept separate from `usage` below rather
+        // than merged into one "utilisation" figure — they answer different
+        // questions and the gap between them is the point.
         cpu: { total: h.cpu_total, used: h.cpu_used },
         ramMb: { total: h.ram_total_mb, used: h.ram_used_mb },
+        usage: presentHostUsage(h),
       })),
     };
   });
@@ -68,8 +75,12 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       cpu_used: number; ram_used_mb: number; status: string; drain: boolean;
       last_heartbeat: string | null; offline_alerted_at: string | null;
       cache_lookups: string | null; cache_hits: string | null;
-    }>(
-      'SELECT id, name, location, cpu_total, ram_total_mb, cpu_used, ram_used_mb, status, drain, last_heartbeat, offline_alerted_at, cache_lookups, cache_hits FROM hosts WHERE id = $1',
+      agent_endpoint: string | null; agent_token: string | null;
+    } & HostUsageColumns>(
+      `SELECT id, name, location, cpu_total, ram_total_mb, cpu_used, ram_used_mb, status, drain,
+              last_heartbeat, offline_alerted_at, cache_lookups, cache_hits,
+              agent_endpoint, agent_token, ${HOST_USAGE_COLUMNS}
+       FROM hosts WHERE id = $1`,
       [id],
     );
     if (host.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
@@ -90,6 +101,21 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     ]);
     const lookups = h.cache_lookups === null ? null : Number(h.cache_lookups);
     const hits = h.cache_hits === null ? null : Number(h.cache_hits);
+
+    // Live per-VM usage, straight from the agent. Best-effort and deliberately
+    // not from the database: nothing persists per-VM measurements, and adding a
+    // row-per-VM-per-sample table to answer a screen that gets opened
+    // occasionally would be a lot of writes for very little. An unreachable
+    // host simply shows committed sizes without actuals, the same as before.
+    const client = clientForHost(h);
+    const liveVms = client
+      ? await client.vms().catch((err) => {
+        req.log.warn({ err, hostId: id }, 'per-VM usage fetch failed');
+        return null;
+      })
+      : null;
+    const byVmId = new Map((liveVms ?? []).map((v) => [v.vmId, v]));
+
     return {
       host: {
         id: h.id, name: h.name, location: h.location, status: h.status, drain: h.drain,
@@ -97,11 +123,21 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         cpu: { total: h.cpu_total, used: h.cpu_used },
         ramMb: { total: h.ram_total_mb, used: h.ram_used_mb },
         cacheHitRate: lookups && lookups > 0 && hits !== null ? hits / lookups : null,
+        usage: presentHostUsage(h),
       },
-      environments: envs.rows.map((e) => ({
-        id: e.id, teamName: e.team_name, vmId: e.vm_id, status: e.status,
-        assignedAt: e.assigned_at, vcpu: e.vcpu, ramMb: e.ram_mb,
-      })),
+      environments: envs.rows.map((e) => {
+        const live = e.vm_id ? byVmId.get(e.vm_id) : undefined;
+        return {
+          id: e.id, teamName: e.team_name, vmId: e.vm_id, status: e.status,
+          assignedAt: e.assigned_at, vcpu: e.vcpu, ramMb: e.ram_mb,
+          // Undefined, not zero, when the guest hasn't reported — a VM still
+          // booting has no measurement, and a fabricated zero here would be
+          // read as "this VM needs nothing".
+          usedMb: live?.usedMb, availableMb: live?.availableMb, cachesMb: live?.cachesMb,
+          balloonMb: live?.balloonMb, usableMb: live?.usableMb,
+          vcpuUsed: live?.vcpuUsed, throttledPct: live?.throttledPct,
+        };
+      }),
       recentFailures: failures.rows.map((f) => ({
         id: f.id, teamName: f.team_name, error: f.error, attempts: f.attempts, occurredAt: f.requested_at,
       })),

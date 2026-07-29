@@ -15,6 +15,42 @@ export interface AgentHealth {
   // debug endpoint is off/unreachable.
   cacheLookups?: number;
   cacheHits?: number;
+  // Measured usage, as opposed to the committed figures above. Undefined when
+  // the agent doesn't report it (an older build, or guests that haven't
+  // answered yet) — which must stay distinguishable from a measured zero, or
+  // an unmeasured host looks idle and attracts every VM on the fleet.
+  usage?: AgentUsage;
+}
+
+/** What the hardware is actually doing, straight from the agent. */
+export interface AgentUsage {
+  ramCommittedMb?: number;
+  ramGrantedMb?: number;
+  ramGuestUsedMb?: number;
+  ramHostAvailableMb?: number;
+  cpuBusyPct?: number;
+  cpuUsedActual?: number;
+  cpuThrottledVms?: number;
+}
+
+/** Per-VM promise-vs-reality for the admin drill-down. Every measured field is
+ *  optional for the same reason as above: a VM still booting has no numbers,
+ *  and rendering that as zero would put a fabricated point into the sample an
+ *  overcommit factor gets derived from. */
+export interface AgentVmUsage {
+  vmId: string;
+  teamId: string;
+  createdAt: string;
+  expiresAt: string;
+  vcpu: number;
+  ramMb: number;
+  balloonMb: number;
+  usableMb?: number;
+  usedMb?: number;
+  availableMb?: number;
+  cachesMb?: number;
+  vcpuUsed?: number;
+  throttledPct?: number;
 }
 
 export class AgentError extends Error {
@@ -75,13 +111,56 @@ export class AgentClient {
     const res = await agentFetch<{
       cpu_total: number; cpu_used: number; ram_total_mb: number; ram_used_mb: number;
       active_vm_count: number; draining: boolean; cache_lookups?: number; cache_hits?: number;
+      memory?: {
+        committed_mb: number; granted_mb: number; guest_used_mb: number;
+        host_total_mb: number; host_available_mb: number;
+      };
+      cpu?: { busy_pct: number; used_vcpu: number; throttled_vms: number };
     }>(this.endpoint, this.token, '/health', { timeoutMs: 5000 });
+
+    // The memory and cpu blocks arrive independently: host CPU is read from
+    // /proc/stat and doesn't depend on any guest answering, while the memory
+    // block only appears once every guest has. A host can legitimately report
+    // one and not the other, so `usage` is present if either is.
+    const usage: AgentUsage = {};
+    if (res.memory) {
+      usage.ramCommittedMb = res.memory.committed_mb;
+      usage.ramGrantedMb = res.memory.granted_mb;
+      usage.ramGuestUsedMb = res.memory.guest_used_mb;
+      usage.ramHostAvailableMb = res.memory.host_available_mb;
+    }
+    if (res.cpu) {
+      usage.cpuBusyPct = res.cpu.busy_pct;
+      usage.cpuUsedActual = res.cpu.used_vcpu;
+      usage.cpuThrottledVms = res.cpu.throttled_vms;
+    }
+
     return {
       cpuTotal: res.cpu_total, cpuUsed: res.cpu_used,
       ramTotalMb: res.ram_total_mb, ramUsedMb: res.ram_used_mb,
       activeVmCount: res.active_vm_count, draining: res.draining,
       cacheLookups: res.cache_lookups, cacheHits: res.cache_hits,
+      usage: res.memory || res.cpu ? usage : undefined,
     };
+  }
+
+  /** Live per-VM usage. Only the admin drill-down calls this — it's a
+   *  round-trip to the host, so it stays out of the health poll's hot path. */
+  async vms(): Promise<AgentVmUsage[]> {
+    const res = await agentFetch<{
+      vms: {
+        vm_id: string; team_id: string; created_at: string; expires_at: string;
+        vcpu: number; ram_mb: number; balloon_mb: number;
+        usable_mb?: number; used_mb?: number; available_mb?: number; caches_mb?: number;
+        vcpu_used?: number; throttled_pct?: number;
+      }[];
+    }>(this.endpoint, this.token, '/vms', { timeoutMs: 8000 });
+    return res.vms.map((v) => ({
+      vmId: v.vm_id, teamId: v.team_id, createdAt: v.created_at, expiresAt: v.expires_at,
+      vcpu: v.vcpu, ramMb: v.ram_mb, balloonMb: v.balloon_mb,
+      usableMb: v.usable_mb, usedMb: v.used_mb, availableMb: v.available_mb, cachesMb: v.caches_mb,
+      vcpuUsed: v.vcpu_used, throttledPct: v.throttled_pct,
+    }));
   }
 }
 

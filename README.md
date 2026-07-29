@@ -56,7 +56,7 @@ and prints the six `STRIPE_PRICE_*` env lines. Then point a webhook at
 | Public | `GET /status` `POST /status/subscribe` `GET /cli/latest-version` `GET /promo` `POST /contact` |
 | Webhooks (in) | `POST /webhooks/stripe` (signature-verified, raw body) |
 | Webhooks (out) | `GET/POST /webhook-endpoints` `PATCH/DELETE /webhook-endpoints/:id` `POST /webhook-endpoints/:id/rotate-secret` `POST /webhook-endpoints/:id/test` `GET /webhook-deliveries` `POST /webhook-deliveries/:id/redeliver` |
-| Admin | `GET /admin/overview` `GET /admin/hosts` `GET /admin/subscribers` `GET /admin/system` `GET /admin/audit` `GET /admin/timeseries` … (all require `users.is_platform_admin`) |
+| Admin | `GET /admin/hosts` and `GET /admin/hosts/:id/detail` carry measured usage beside the committed figures; the detail view also fetches live per-VM usage from the agent. `GET /admin/overview` `GET /admin/hosts` `GET /admin/subscribers` `GET /admin/system` `GET /admin/audit` `GET /admin/timeseries` … (all require `users.is_platform_admin`) |
 
 Sessions are httpOnly cookies (`devplat_session`, SameSite=Lax, shared across
 `.devplat.ch`); `Authorization: Bearer <jwt>` works too. Team roles:
@@ -134,6 +134,32 @@ host compromise. Non-public addresses are refused *inside the socket's DNS
 lookup*, not in a check beforehand — a check-then-connect implementation is
 defeated by DNS rebinding. Redirects are never followed, and `node:https` is
 used precisely because it supports a custom `lookup` and doesn't follow them.
+
+### Host usage telemetry
+
+`hosts.cpu_used` / `ram_used_mb` are the sum of what running VMs' plans
+*promised*. That is the right thing to admit against — it is what must be
+honourable if every guest peaks at once — but it cannot move when load does, so
+it says nothing about whether the hardware is busy.
+
+Migration 035 adds a second, measured set of columns beside them: what guests
+report using, what the balloons hold back, the host's own `MemAvailable`, CPU
+busy share, actual vCPU consumption, and how many guests hit their `cpu.max`
+quota. Both the agent heartbeat and the scheduler's health poll write them.
+
+**Every one of those columns is nullable, and that is load-bearing.** `NULL`
+means the host's agent does not report it. A reader treating `NULL` as `0` would
+see an unmeasured host as completely idle — the most attractive possible target
+for the next placement, and the least true. `usage_reported_at` carries the same
+weight for staleness: an agent that dies leaves its last values sitting in the
+row looking current forever, so `lib/hostUsage.ts` treats anything older than
+two minutes as unmeasured. Absent and stale are kept distinguishable because the
+dashboard says different things about a host running an old agent and one whose
+agent just died.
+
+Nothing acts on any of this yet. It exists so an overcommit factor can be sized
+from evidence rather than estimated, and so placement can later be ordered by
+real load.
 
 ### Capacity pressure
 

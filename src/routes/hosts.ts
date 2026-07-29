@@ -115,24 +115,60 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
           draining: { type: 'boolean' },
           cacheLookups: { type: 'integer', minimum: 0 },
           cacheHits: { type: 'integer', minimum: 0 },
+          // Measured usage — see migration 035. All optional: an agent
+          // predating this, or one whose guests haven't answered, sends none
+          // of it, and that must stay distinguishable from a measured zero.
+          ramCommittedMb: { type: 'integer', minimum: 0 },
+          ramGrantedMb: { type: 'integer', minimum: 0 },
+          ramGuestUsedMb: { type: 'integer', minimum: 0 },
+          hostAvailableMb: { type: 'integer', minimum: 0 },
+          cpuBusyPct: { type: 'integer', minimum: 0, maximum: 100 },
+          cpuUsedVcpu: { type: 'number', minimum: 0 },
+          throttledVms: { type: 'integer', minimum: 0 },
         },
       },
     },
   }, async (req) => {
-    const { cpuUsed, ramUsedMb, draining, cacheLookups, cacheHits } = req.body as {
+    const {
+      cpuUsed, ramUsedMb, draining, cacheLookups, cacheHits,
+      ramCommittedMb, ramGrantedMb, ramGuestUsedMb, hostAvailableMb,
+      cpuBusyPct, cpuUsedVcpu, throttledVms,
+    } = req.body as {
       cpuUsed: number; ramUsedMb: number; activeVmCount: number; draining?: boolean;
       cacheLookups?: number; cacheHits?: number;
+      ramCommittedMb?: number; ramGrantedMb?: number; ramGuestUsedMb?: number; hostAvailableMb?: number;
+      cpuBusyPct?: number; cpuUsedVcpu?: number; throttledVms?: number;
     };
     // Cache counters are optional (absent when the host's registry debug
     // endpoint is off). COALESCE keeps the last known values instead of
     // nulling them on a heartbeat that happened to omit them.
+    //
+    // The usage columns take the same treatment, plus usage_reported_at is
+    // stamped only when something was actually measured. That timestamp is what
+    // lets a reader tell fresh measurements from an hour-old snapshot left
+    // behind by an agent that has since stopped reporting — placing against
+    // those would be placing against history.
+    const measured = ramCommittedMb !== undefined || cpuBusyPct !== undefined;
     await query(
       `UPDATE hosts SET last_heartbeat = now(), cpu_used = $1, ram_used_mb = $2,
               status = $3,
               cache_lookups = COALESCE($4, cache_lookups),
-              cache_hits = COALESCE($5, cache_hits)
-       WHERE id = $6`,
-      [cpuUsed, ramUsedMb, draining ? 'draining' : 'online', cacheLookups ?? null, cacheHits ?? null, req.hostId],
+              cache_hits = COALESCE($5, cache_hits),
+              ram_committed_mb = COALESCE($6, ram_committed_mb),
+              ram_granted_mb = COALESCE($7, ram_granted_mb),
+              ram_guest_used_mb = COALESCE($8, ram_guest_used_mb),
+              ram_host_available_mb = COALESCE($9, ram_host_available_mb),
+              cpu_busy_pct = COALESCE($10, cpu_busy_pct),
+              cpu_used_actual = COALESCE($11, cpu_used_actual),
+              cpu_throttled_vms = COALESCE($12, cpu_throttled_vms),
+              usage_reported_at = CASE WHEN $13 THEN now() ELSE usage_reported_at END
+       WHERE id = $14`,
+      [
+        cpuUsed, ramUsedMb, draining ? 'draining' : 'online', cacheLookups ?? null, cacheHits ?? null,
+        ramCommittedMb ?? null, ramGrantedMb ?? null, ramGuestUsedMb ?? null, hostAvailableMb ?? null,
+        cpuBusyPct ?? null, cpuUsedVcpu ?? null, throttledVms ?? null,
+        measured, req.hostId,
+      ],
     );
     return { ok: true };
   });
