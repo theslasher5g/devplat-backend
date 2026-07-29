@@ -19,30 +19,20 @@ export async function processQueue(): Promise<void> {
   );
   if (queued.rowCount === 0) return;
 
-  // Recheck each team's running count once per tick rather than per row —
-  // several queued rows for the same team shouldn't all pass a stale check.
-  const runningByTeam = new Map<string, number>();
-  for (const r of queued.rows) {
-    if (!runningByTeam.has(r.team_id)) {
-      const running = await query<{ count: string }>(
-        "SELECT count(*) FROM environment_requests WHERE team_id = $1 AND status = 'assigned'",
-        [r.team_id],
-      );
-      runningByTeam.set(r.team_id, Number(running.rows[0].count));
-    }
-  }
-
+  // No per-team bookkeeping here any more. tryAssign reserves the slot under a
+  // per-team advisory lock (see allocator.reserveSlot), which is the only
+  // count that can be trusted — this worker runs concurrently with the API's
+  // own POST /environments handler, so a tally held in this process was a
+  // second, unsynchronised source of truth. It simply asks, and skips the row
+  // when there's no room.
   for (const r of queued.rows) {
     const plan = getPlan(r.plan_tier);
     const trialExpired = r.plan_tier === 'free' && new Date(r.trial_ends_at) < new Date();
-    const limit = trialExpired ? 0 : plan.parallelEnvs;
-    const running = runningByTeam.get(r.team_id) ?? 0;
-    if (running >= limit) continue;
-
-    const result = await tryAssign(r.id, r.team_id, plan.vcpuPerEnv, plan.ramMbPerEnv);
-    if (result?.status === 'assigned') {
-      runningByTeam.set(r.team_id, running + 1);
-    }
+    await tryAssign(r.id, r.team_id, {
+      parallelEnvs: trialExpired ? 0 : plan.parallelEnvs,
+      vcpu: plan.vcpuPerEnv,
+      ramMb: plan.ramMbPerEnv,
+    });
   }
 }
 

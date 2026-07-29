@@ -26,14 +26,50 @@ export const DEFAULT_TTL_MINUTES = 60;
 // single failure) instead of retrying forever.
 const MAX_ASSIGN_ATTEMPTS = 5;
 
-/** Requests currently occupying a slot for a team — matches the assigned rows
- *  1:1 with a running usage_events(start) that has no usage_events(stop) yet. */
-async function runningCount(teamId: string): Promise<number> {
-  const row = await one<{ count: string }>(
-    "SELECT count(*) FROM environment_requests WHERE team_id = $1 AND status = 'assigned'",
-    [teamId],
-  );
-  return Number(row.count);
+/** Advisory-lock namespace for per-team slot reservation. Distinct from the
+ *  scheduler-loop namespace in lib/advisoryLock.ts so the two can never
+ *  collide on a key. */
+const SLOT_LOCK_NAMESPACE = 1_684_957_100;
+
+/**
+ * Atomically claim a parallelism slot for `requestId`, or report there's none.
+ *
+ * This is the fix for a real over-allocation bug. requestEnvironment() used to
+ * count running environments, compare against the plan cap, and only then call
+ * tryAssign — with a createVm() taking seconds in between. Every concurrent
+ * request read the same pre-assignment count and every one of them passed the
+ * check. Reproduced against Postgres: five simultaneous requests against a
+ * two-environment plan all got assigned. The trigger isn't exotic — a CI matrix
+ * starting four jobs at once is the product's normal usage — and parallelism is
+ * exactly what customers pay for, so the cap leaking is a billing problem, not
+ * just a capacity one.
+ *
+ * The count and the claim now happen together under a per-team advisory lock,
+ * so concurrent callers serialise on exactly this decision. The lock is
+ * transaction-scoped and released at COMMIT, well before createVm() runs —
+ * booting VMs stays parallel, only the bookkeeping is serialised.
+ */
+export async function reserveSlot(teamId: string, requestId: string, parallelEnvs: number): Promise<boolean> {
+  return withTransaction(async (tx) => {
+    // hashtext() maps the uuid to the int the advisory-lock API wants. A hash
+    // collision between two teams would only mean they briefly queue behind
+    // each other here, never a wrong decision.
+    await tx.query('SELECT pg_advisory_xact_lock($1, hashtext($2))', [SLOT_LOCK_NAMESPACE, teamId]);
+
+    const used = await tx.query<{ count: string }>(
+      "SELECT count(*) FROM environment_requests WHERE team_id = $1 AND status IN ('assigned', 'assigning')",
+      [teamId],
+    );
+    if (Number(used.rows[0].count) >= parallelEnvs) return false;
+
+    // Claiming inside the lock is what makes the count above trustworthy for
+    // the next caller: they'll see this row as 'assigning' and count it.
+    const claimed = await tx.query<{ id: string }>(
+      "UPDATE environment_requests SET status = 'assigning', claimed_at = now() WHERE id = $1 AND status = 'queued' RETURNING id",
+      [requestId],
+    );
+    return (claimed.rowCount ?? 0) === 1;
+  });
 }
 
 export interface EffectivePlan {
@@ -86,8 +122,23 @@ async function candidateHosts(vcpu: number, ramMb: number): Promise<HostRow[]> {
  *  (e.g. after a plan/plan-override change asks for a bigger per-VM size
  *  than any host has free) impossible to diagnose from the logs. */
 export async function tryAssign(
-  requestId: string, teamId: string, vcpu: number, ramMb: number, logIfNoCapacity = false,
+  requestId: string, teamId: string, plan: EffectivePlan, logIfNoCapacity = false,
 ): Promise<EnvironmentResult | null> {
+  const { vcpu, ramMb, parallelEnvs } = plan;
+
+  // Reserve the parallelism slot FIRST, before looking at hosts. Doing it in
+  // this order means a team at its cap never even inspects host capacity, and
+  // — more importantly — the claim that stops a concurrent request from
+  // double-booking happens before anything slow.
+  //
+  // Claiming the row also solves a second, older problem: createVm() boots a
+  // real VM and waits for its guest dockerd, which can still be in flight on
+  // the next queue-worker tick. Without a claim, that tick's own
+  // `WHERE status = 'queued'` would see this row untouched and start a
+  // second, independent tryAssign for it — each booting its own VM, with only
+  // the last UPDATE remembered and every earlier VM silently orphaned.
+  if (!(await reserveSlot(teamId, requestId, parallelEnvs))) return null;
+
   const hosts = await candidateHosts(vcpu, ramMb);
   if (hosts.length === 0) {
     if (logIfNoCapacity) {
@@ -96,25 +147,11 @@ export async function tryAssign(
         'will retry as capacity frees up; check /admin Hosts for online status and free CPU/RAM.',
       );
     }
+    // Give the slot back — holding it while no host can serve it would count
+    // against the team's cap for nothing.
+    await query("UPDATE environment_requests SET status = 'queued', claimed_at = NULL WHERE id = $1 AND status = 'assigning'", [requestId]);
     return null;
   }
-
-  // Claim the row before doing anything slow. createVm() boots a real VM and
-  // waits for its guest dockerd to become reachable — that can take several
-  // seconds, long enough to still be in flight on the next queue-worker tick
-  // (see queueWorker.ts, ticking every few seconds). Without a claim, that
-  // next tick's own SELECT ... WHERE status = 'queued' would see this same
-  // row untouched and start a second, fully independent tryAssign() for it —
-  // each one booting its own VM. Only the last UPDATE below would ever be
-  // remembered, silently orphaning every earlier VM as a permanently
-  // running, permanently untracked resource leak. This was masked as long
-  // as createVm() was slow enough to reliably blow past every timeout layer
-  // (it just failed instead of racing) — fixing that unmasked this bug.
-  const claimed = await maybeOne<{ id: string }>(
-    "UPDATE environment_requests SET status = 'assigning', claimed_at = now() WHERE id = $1 AND status = 'queued' RETURNING id",
-    [requestId],
-  );
-  if (!claimed) return null; // already claimed by a concurrent attempt
 
   let lastError = '';
   for (const host of hosts) {
@@ -218,12 +255,12 @@ export async function requestEnvironment(teamId: string, tokenId: string | null 
     [teamId, tokenId],
   );
 
-  const [plan, running] = await Promise.all([effectivePlan(teamId), runningCount(teamId)]);
-  if (running >= plan.parallelEnvs) {
-    return { requestId: request.id, status: 'queued' };
-  }
-
-  const result = await tryAssign(request.id, teamId, plan.vcpu, plan.ramMb, true);
+  // No pre-check here any more: reserveSlot inside tryAssign does the count
+  // and the claim together under a per-team lock, so a check out here would be
+  // both redundant and — being unsynchronised — the very thing that let the
+  // cap leak. tryAssign simply returns null when there's no slot.
+  const plan = await effectivePlan(teamId);
+  const result = await tryAssign(request.id, teamId, plan, true);
   if (result) return result;
 
   // Capacity existed on paper but every reachable host failed — leave it
