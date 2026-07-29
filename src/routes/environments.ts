@@ -132,8 +132,14 @@ export default async function environmentRoutes(app: FastifyInstance): Promise<v
     }>(
       `SELECT er.id, er.status, er.vm_id, er.error, er.requested_at, er.assigned_at, er.released_at,
               h.name AS host_name, h.location AS region,
-              CASE WHEN er.assigned_at IS NOT NULL
-                   THEN EXTRACT(EPOCH FROM (COALESCE(er.released_at, now()) - er.assigned_at))::int
+              -- Both timestamps required. This query only returns terminal runs
+              -- (released/failed), so COALESCE(released_at, now()) was wrong
+              -- here: a run that failed at boot and never got a release stamp
+              -- was reported as still accumulating, claiming "9h 2m" an hour
+              -- later and "30 days" next month. Unknown is null — the UI shows
+              -- "—" rather than a number that is confidently false.
+              CASE WHEN er.assigned_at IS NOT NULL AND er.released_at IS NOT NULL
+                   THEN EXTRACT(EPOCH FROM (er.released_at - er.assigned_at))::int
                    END AS duration_seconds
        FROM environment_requests er LEFT JOIN hosts h ON h.id = er.host_id
        WHERE er.team_id = $1 AND er.status IN ('released', 'failed')
