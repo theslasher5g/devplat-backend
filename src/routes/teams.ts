@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { config, type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { getPlan, maxFootprintGb } from '../plans.js';
+import { resolveTtlMinutes } from '../scheduler/allocator.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { AUDIT_CSV_HEADER, auditCsvRow, auditFilters } from '../lib/auditExport.js';
 import { sendTeamInviteEmail, sendTwoFactorRequiredEmail } from '../lib/email.js';
@@ -121,8 +122,13 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     // Entitlement view: the effective tier (a manual plan_override if set, else
     // the billing plan_tier) drives the caps shown here. The billing plan and
     // its subscription state live under /billing/subscription.
-    const team = await one<{ id: string; name: string; plan_tier: PlanTier; trial_ends_at: string; created_at: string }>(
-      'SELECT id, name, COALESCE(plan_override, plan_tier) AS plan_tier, trial_ends_at, created_at FROM teams WHERE id = $1',
+    const team = await one<{
+      id: string; name: string; plan_tier: PlanTier; trial_ends_at: string; created_at: string;
+      environment_ttl_minutes: number | null;
+    }>(
+      `SELECT id, name, COALESCE(plan_override, plan_tier) AS plan_tier, trial_ends_at, created_at,
+              environment_ttl_minutes
+       FROM teams WHERE id = $1`,
       [req.membership.teamId],
     );
     const members = await query<{ user_id: string; email: string; role: string; created_at: string }>(
@@ -153,6 +159,12 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         // doesn't have to guess.
         maxMembers: getPlan(team.plan_tier).maxMembers,
         seatsUsed: (members.rowCount ?? 0) + (invites.rowCount ?? 0),
+        // Environment lifetime: what's in force, what the plan defaults to,
+        // and how far it may be raised. Sent together so the UI can render the
+        // control (and explain a fixed tier) without knowing the plan table.
+        ttlMinutes: resolveTtlMinutes(getPlan(team.plan_tier), team.environment_ttl_minutes),
+        ttlDefaultMinutes: getPlan(team.plan_tier).ttlDefaultMinutes,
+        ttlMaxMinutes: getPlan(team.plan_tier).ttlMaxMinutes,
         trialEndsAt: team.trial_ends_at,
         createdAt: team.created_at,
         myRole: req.membership.role,
@@ -350,11 +362,55 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
 
   app.patch('/teams/me', {
     preHandler: requireTeamAdmin,
-    schema: { body: { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 1, maxLength: 100 } } } },
-  }, async (req) => {
-    const { name } = req.body as { name: string };
-    await query('UPDATE teams SET name = $1 WHERE id = $2', [name.trim(), req.membership.teamId]);
-    await auditFromReq(req, 'team.rename', { target: name.trim() });
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 100 },
+          // null resets to the plan default. The schema's bounds are the widest
+          // any plan allows; the per-plan ceiling is enforced below, because it
+          // depends on the team's tier and a static schema can't know it.
+          environmentTtlMinutes: { type: ['integer', 'null'], minimum: 5, maximum: 120 },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const body = req.body as { name?: string; environmentTtlMinutes?: number | null };
+
+    if (typeof body.name === 'string') {
+      await query('UPDATE teams SET name = $1 WHERE id = $2', [body.name.trim(), req.membership.teamId]);
+      await auditFromReq(req, 'team.rename', { target: body.name.trim() });
+    }
+
+    if ('environmentTtlMinutes' in body) {
+      const team = await one<{ plan_tier: PlanTier }>(
+        'SELECT COALESCE(plan_override, plan_tier) AS plan_tier FROM teams WHERE id = $1', [req.membership.teamId],
+      );
+      const plan = getPlan(team.plan_tier);
+      // A tier where the default already is the ceiling has nothing to
+      // configure — say so rather than accepting a value that resolveTtlMinutes
+      // would silently clamp back to the default.
+      if (plan.ttlMaxMinutes <= plan.ttlDefaultMinutes) {
+        return reply.code(409).send({
+          error: 'ttl_not_configurable',
+          detail: `The ${plan.label} plan runs a fixed ${plan.ttlDefaultMinutes}-minute environment lifetime. `
+            + 'Team and Scale can change it.',
+        });
+      }
+      const value = body.environmentTtlMinutes;
+      if (value !== null && value !== undefined && value > plan.ttlMaxMinutes) {
+        return reply.code(400).send({
+          error: 'ttl_too_long',
+          detail: `The ${plan.label} plan allows up to ${plan.ttlMaxMinutes} minutes.`,
+        });
+      }
+      await query('UPDATE teams SET environment_ttl_minutes = $1 WHERE id = $2', [value ?? null, req.membership.teamId]);
+      await auditFromReq(req, 'team.ttl_changed', {
+        target: req.user.email,
+        detail: { minutes: value ?? `plan default (${plan.ttlDefaultMinutes})` },
+      });
+    }
+
     return { ok: true };
   });
 

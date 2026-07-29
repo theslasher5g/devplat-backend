@@ -1,6 +1,6 @@
 import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
-import { getPlan } from '../plans.js';
+import { type Plan, getPlan } from '../plans.js';
 import { AgentError, clientForHost, hostFits, hostFreeCpu } from './agentClient.js';
 
 export interface HostRow {
@@ -17,6 +17,8 @@ export interface EnvironmentResult {
   error?: string;
 }
 
+/** Fallback only — every real path resolves the TTL per team via
+ *  effectivePlan(). Kept for the rare caller that has no team context. */
 export const DEFAULT_TTL_MINUTES = 60;
 
 // How many times to retry placing a request whose candidate hosts all failed
@@ -78,18 +80,40 @@ export interface EffectivePlan {
   /** Per-environment resource cap the scheduler enforces on the microVM. */
   vcpu: number;
   ramMb: number;
+  /** Minutes before the agent's reaper tears an environment down. */
+  ttlMinutes: number;
+}
+
+/**
+ * Resolve a team's TTL: their override if they have one, otherwise the plan
+ * default — and never above the plan's ceiling.
+ *
+ * Clamping on read rather than on write is deliberate. A team that sets 120 on
+ * Scale and later downgrades keeps the stored 120, but gets their new plan's
+ * ceiling until they upgrade again; the moment they come back, their old
+ * setting is simply in effect once more. Clamping at write time would have
+ * quietly destroyed the number instead.
+ */
+export function resolveTtlMinutes(plan: Plan, override: number | null): number {
+  return Math.min(override ?? plan.ttlDefaultMinutes, plan.ttlMaxMinutes);
 }
 
 /** A team's current plan caps, with the free-trial-expiry rule applied. Uses
  *  the entitlement tier — a manual plan_override if set, else the billing
  *  plan_tier — so an admin can grant capacity without a Stripe subscription. */
 export async function effectivePlan(teamId: string): Promise<EffectivePlan> {
-  const team = await one<{ plan_tier: PlanTier; trial_ends_at: string }>(
-    'SELECT COALESCE(plan_override, plan_tier) AS plan_tier, trial_ends_at FROM teams WHERE id = $1', [teamId],
+  const team = await one<{ plan_tier: PlanTier; trial_ends_at: string; environment_ttl_minutes: number | null }>(
+    'SELECT COALESCE(plan_override, plan_tier) AS plan_tier, trial_ends_at, environment_ttl_minutes FROM teams WHERE id = $1',
+    [teamId],
   );
   const plan = getPlan(team.plan_tier);
   const trialExpired = team.plan_tier === 'free' && new Date(team.trial_ends_at) < new Date();
-  return { parallelEnvs: trialExpired ? 0 : plan.parallelEnvs, vcpu: plan.vcpuPerEnv, ramMb: plan.ramMbPerEnv };
+  return {
+    parallelEnvs: trialExpired ? 0 : plan.parallelEnvs,
+    vcpu: plan.vcpuPerEnv,
+    ramMb: plan.ramMbPerEnv,
+    ttlMinutes: resolveTtlMinutes(plan, team.environment_ttl_minutes),
+  };
 }
 
 /** Hosts that can fit a VM of the given size, most-free-CPU first. Excludes
@@ -124,7 +148,7 @@ async function candidateHosts(vcpu: number, ramMb: number): Promise<HostRow[]> {
 export async function tryAssign(
   requestId: string, teamId: string, plan: EffectivePlan, logIfNoCapacity = false,
 ): Promise<EnvironmentResult | null> {
-  const { vcpu, ramMb, parallelEnvs } = plan;
+  const { vcpu, ramMb, parallelEnvs, ttlMinutes } = plan;
 
   // Reserve the parallelism slot FIRST, before looking at hosts. Doing it in
   // this order means a team at its cap never even inspects host capacity, and
@@ -158,14 +182,14 @@ export async function tryAssign(
     const client = clientForHost(host);
     if (!client) continue;
     try {
-      const vm = await client.createVm(teamId, DEFAULT_TTL_MINUTES, vcpu, ramMb);
+      const vm = await client.createVm(teamId, ttlMinutes, vcpu, ramMb);
       const assignedRow = await maybeOne<{ id: string }>(
         `UPDATE environment_requests
          SET status = 'assigned', host_id = $1, vm_id = $2, docker_endpoint = $3,
-             vcpu = $4, ram_mb = $5, assigned_at = now()
-         WHERE id = $6 AND status = 'assigning'
+             vcpu = $4, ram_mb = $5, ttl_minutes = $6, assigned_at = now()
+         WHERE id = $7 AND status = 'assigning'
          RETURNING id`,
-        [host.id, vm.vmId, vm.dockerEndpoint, vcpu, ramMb, requestId],
+        [host.id, vm.vmId, vm.dockerEndpoint, vcpu, ramMb, ttlMinutes, requestId],
       );
       if (!assignedRow) {
         // Released (or otherwise moved on) while createVm() was in flight —

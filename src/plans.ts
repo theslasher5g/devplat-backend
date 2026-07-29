@@ -20,6 +20,11 @@ export interface Plan {
   trialDurationDays: number | null;
   /** Seat cap for the team; null means unlimited (top tier). */
   maxMembers: number | null;
+  /** Environment TTL this tier gets by default, in minutes. */
+  ttlDefaultMinutes: number;
+  /** Highest TTL this tier may be raised to. Equal to the default on tiers
+   *  where the TTL is fixed, which is how "not configurable" is expressed. */
+  ttlMaxMinutes: number;
 }
 
 const TIER_ORDER: PlanTier[] = ['free', 'solo', 'team', 'scale'];
@@ -32,10 +37,11 @@ export async function loadPlans(): Promise<void> {
     max_parallel_environments: number; vcpu_per_environment: number;
     ram_gb_per_environment: number; trial_duration_days: number | null;
     max_members: number | null;
+    ttl_default_minutes: number; ttl_max_minutes: number;
   }>(
     `SELECT id, name, price_chf_monthly, max_parallel_environments,
             vcpu_per_environment, ram_gb_per_environment, trial_duration_days,
-            max_members
+            max_members, ttl_default_minutes, ttl_max_minutes
      FROM plans`,
   );
   const map = {} as Record<PlanTier, Plan>;
@@ -49,6 +55,8 @@ export async function loadPlans(): Promise<void> {
       ramMbPerEnv: r.ram_gb_per_environment * 1024,
       trialDurationDays: r.trial_duration_days,
       maxMembers: r.max_members,
+      ttlDefaultMinutes: r.ttl_default_minutes,
+      ttlMaxMinutes: r.ttl_max_minutes,
     };
   }
   for (const tier of TIER_ORDER) {
