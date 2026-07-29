@@ -48,13 +48,14 @@ and prints the six `STRIPE_PRICE_*` env lines. Then point a webhook at
 | Teams | `GET /teams` `POST /teams` `POST /teams/switch` `GET/PATCH/DELETE /teams/me` `POST /teams/me/invites` `DELETE /teams/me/invites/:id` `GET /invites/:token` `POST /invites/:token/accept` `PATCH/DELETE /teams/me/members/:userId` `POST /teams/me/leave` `POST /teams/me/transfer-ownership` |
 | Team security | `GET/PATCH /teams/me/security` (team-wide 2FA requirement) |
 | Audit | `GET /teams/me/audit` `GET /teams/me/audit/actions` `GET /teams/me/audit/export?format=csv\|json` |
-| Environments | `POST /environments` `GET /environments(/:id)` `DELETE /environments/:id` `GET /environments/:id/tunnel(/:port)` `GET /environments/:id/containers` `GET /environments/history` `GET /environments/usage` |
+| Environments | `POST /environments` `GET /environments(/:id)` `DELETE /environments/:id` `GET /environments/:id/tunnel(/:port)` `GET /environments/:id/containers` `GET /environments/history` `GET /environments/usage` `GET /environments/pressure` |
 | Scheduler | `GET /teams/:id/limits` (session **or** `Authorization: Bearer dvp_…` API token) |
 | API tokens | `GET/POST /tokens` `DELETE /tokens/:id` (plaintext returned exactly once on create; optional `expiresInDays` + `ipAllowlist`) |
 | Billing | `GET /billing/subscription` `POST /billing/checkout` `POST /billing/portal` `GET /billing/invoices` |
 | Account | `GET /account/export` (GDPR Art. 15/20) |
 | Public | `GET /status` `POST /status/subscribe` `GET /cli/latest-version` `GET /promo` `POST /contact` |
-| Webhooks | `POST /webhooks/stripe` (signature-verified, raw body) |
+| Webhooks (in) | `POST /webhooks/stripe` (signature-verified, raw body) |
+| Webhooks (out) | `GET/POST /webhook-endpoints` `PATCH/DELETE /webhook-endpoints/:id` `POST /webhook-endpoints/:id/rotate-secret` `POST /webhook-endpoints/:id/test` `GET /webhook-deliveries` `POST /webhook-deliveries/:id/redeliver` |
 | Admin | `GET /admin/overview` `GET /admin/hosts` `GET /admin/subscribers` `GET /admin/system` `GET /admin/audit` `GET /admin/timeseries` … (all require `users.is_platform_admin`) |
 
 Sessions are httpOnly cookies (`devplat_session`, SameSite=Lax, shared across
@@ -107,12 +108,40 @@ input before it reaches the database. Rejections use distinct error codes
 
 ## Background jobs
 
-The queue worker, health poller and trial-notice sweep each run under a
-Postgres advisory lock (`src/lib/advisoryLock.ts`), so exactly one instance
-executes a given tick even with multiple replicas or during a rolling deploy.
+The queue worker, health poller, maintenance sweep, capacity-notice sweep,
+trial-notice sweep and webhook delivery worker each run under a Postgres
+advisory lock (`src/lib/advisoryLock.ts`), so exactly one instance executes a
+given tick even with multiple replicas or during a rolling deploy.
 `pg_try_advisory_lock` is non-blocking — a losing instance skips that tick
 rather than queueing a backlog — and the lock is released with the connection,
 so a killed instance can't wedge the scheduler.
+
+### Outgoing webhooks
+
+Environment events (`environment.assigned` / `.released` / `.failed` /
+`.queued_at_limit`) are queued into `webhook_deliveries` and sent by the
+delivery worker: six attempts over ~9 hours, `2xx` to acknowledge, and an
+endpoint is auto-disabled after ten consecutive undeliverable events.
+
+Each request carries `devplat-signature: t=<unix>,v1=<hmac-sha256 of
+"t.body">`. The timestamp is part of the signed material, which is what lets a
+receiver reject a replayed delivery.
+
+**SSRF is the real risk here**, and `src/lib/ssrfGuard.ts` is the control: this
+process is on the WireGuard mesh and can reach every agent's unauthenticated
+Docker API, so a webhook URL of `http://10.x.x.x:2375/…` would otherwise be a
+host compromise. Non-public addresses are refused *inside the socket's DNS
+lookup*, not in a check beforehand — a check-then-connect implementation is
+defeated by DNS rebinding. Redirects are never followed, and `node:https` is
+used precisely because it supports a custom `lookup` and doesn't follow them.
+
+### Capacity pressure
+
+`reserveSlot()` stamps `environment_requests.capacity_blocked_at` the first
+time a run is turned away by the team's own parallelism cap (never on retries,
+and never for a lapsed trial). That feeds `GET /environments/pressure`, the
+dashboard notice, and a monthly owner email when five or more runs waited
+inside a fortnight.
 
 ## Tests
 
@@ -122,7 +151,10 @@ npm test        # node:test, no database required
 
 Covers the pure-logic pieces where a silent regression is expensive: TOTP
 against the RFC 6238 vectors, the password policy and HIBP lookup (with `fetch`
-stubbed), CIDR validation, and audit-export filter parsing and CSV escaping.
+stubbed), CIDR validation, audit-export filter parsing and CSV escaping,
+webhook signing/replay rejection, and the SSRF address filter — including an
+end-to-end case that stands up a real loopback HTTP server and asserts a
+guarded request never reaches it.
 
 ## Deployment on the VPS
 

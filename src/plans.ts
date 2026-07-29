@@ -76,6 +76,15 @@ export function allPlans(): Plan[] {
   return TIER_ORDER.map(getPlan);
 }
 
+/** The next tier up, or null at the top. Used to turn "you keep hitting your
+ *  limit" into a concrete suggestion rather than a complaint. Free's next step
+ *  is Solo — the trial ladder and the paid ladder are the same list. */
+export function nextTierUp(tier: PlanTier): Plan | null {
+  const i = TIER_ORDER.indexOf(tier);
+  if (i < 0 || i === TIER_ORDER.length - 1) return null;
+  return getPlan(TIER_ORDER[i + 1]);
+}
+
 /** Max total RAM a tier can occupy at once, in GB (derived, never stored). */
 export function maxFootprintGb(plan: Plan): number {
   return Math.round((plan.parallelEnvs * plan.ramMbPerEnv) / 1024);

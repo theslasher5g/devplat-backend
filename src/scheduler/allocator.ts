@@ -1,6 +1,7 @@
 import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { type Plan, getPlan } from '../plans.js';
+import { emitWebhook } from '../lib/webhooks.js';
 import { AgentError, clientForHost, hostFits, hostFreeCpu } from './agentClient.js';
 
 export interface HostRow {
@@ -52,7 +53,13 @@ const SLOT_LOCK_NAMESPACE = 1_684_957_100;
  * booting VMs stays parallel, only the bookkeeping is serialised.
  */
 export async function reserveSlot(teamId: string, requestId: string, parallelEnvs: number): Promise<boolean> {
-  return withTransaction(async (tx) => {
+  // Set inside the transaction, acted on after it commits: emitWebhook talks to
+  // the pool on its own connection, and doing that while holding the per-team
+  // advisory lock would widen the one critical section the whole fix depends on
+  // being short.
+  let firstRefusal = false;
+
+  const granted = await withTransaction(async (tx) => {
     // hashtext() maps the uuid to the int the advisory-lock API wants. A hash
     // collision between two teams would only mean they briefly queue behind
     // each other here, never a wrong decision.
@@ -62,7 +69,32 @@ export async function reserveSlot(teamId: string, requestId: string, parallelEnv
       "SELECT count(*) FROM environment_requests WHERE team_id = $1 AND status IN ('assigned', 'assigning')",
       [teamId],
     );
-    if (Number(used.rows[0].count) >= parallelEnvs) return false;
+    if (Number(used.rows[0].count) >= parallelEnvs) {
+      // This is the one place in the system that knows a run is waiting for a
+      // slot the team's own plan doesn't have — as opposed to waiting for host
+      // capacity, which looks identical from the outside ('queued' either way).
+      // Stamp it so the pressure is reportable; see migration 033.
+      //
+      // `WHERE capacity_blocked_at IS NULL` rather than an unconditional set:
+      // the queue worker retries every queued row every few seconds, so
+      // overwriting would reset the clock on each tick and report a 20-minute
+      // wait as a 5-second one. It also gives the edge for free — one affected
+      // row means this is the first time this run was turned away, which is
+      // exactly when the webhook should fire and never again for the same run.
+      //
+      // parallelEnvs === 0 means a lapsed free trial, not pressure. Those teams
+      // have nothing to upgrade *from* and already get the trial-ending mail;
+      // counting them here would turn every expired trial into a false "you
+      // keep hitting your limit" signal.
+      if (parallelEnvs > 0) {
+        const stamped = await tx.query(
+          'UPDATE environment_requests SET capacity_blocked_at = now() WHERE id = $1 AND capacity_blocked_at IS NULL RETURNING id',
+          [requestId],
+        );
+        firstRefusal = (stamped.rowCount ?? 0) === 1;
+      }
+      return false;
+    }
 
     // Claiming inside the lock is what makes the count above trustworthy for
     // the next caller: they'll see this row as 'assigning' and count it.
@@ -72,6 +104,15 @@ export async function reserveSlot(teamId: string, requestId: string, parallelEnv
     );
     return (claimed.rowCount ?? 0) === 1;
   });
+
+  if (firstRefusal) {
+    await emitWebhook(teamId, 'environment.queued_at_limit', {
+      requestId,
+      limit: parallelEnvs,
+      reason: 'All parallel environments on this plan are in use. The run starts automatically when one frees up.',
+    });
+  }
+  return granted;
 }
 
 export interface EffectivePlan {
@@ -215,6 +256,10 @@ export async function tryAssign(
           [vcpu, ramMb, host.id],
         );
       });
+      await emitWebhook(teamId, 'environment.assigned', {
+        requestId, vmId: vm.vmId, hostName: host.name, dockerEndpoint: vm.dockerEndpoint,
+        vcpu, ramMb, ttlMinutes,
+      });
       return { requestId, status: 'assigned', hostId: host.id, vmId: vm.vmId, dockerEndpoint: vm.dockerEndpoint };
     } catch (err) {
       const message = err instanceof AgentError ? err.message : (err as Error).message;
@@ -248,6 +293,9 @@ export async function tryAssign(
       [requestId, error],
     );
     await query("INSERT INTO usage_events (team_id, event_type) VALUES ($1, 'start_failed')", [teamId]);
+    // The event a customer actually wants in Slack: their pipeline is about to
+    // fail and this says why, without anyone opening the dashboard.
+    await emitWebhook(teamId, 'environment.failed', { requestId, error, attempts: bumped.attempts });
     return { requestId, status: 'failed', error };
   }
   // Not given up yet — release the claim so the queue worker retries it.
@@ -304,7 +352,10 @@ export async function releaseEnvironment(teamId: string, requestId: string): Pro
     "UPDATE environment_requests SET status = 'released', released_at = now() WHERE id = $1 AND team_id = $2 AND status IN ('queued', 'assigning') RETURNING id",
     [requestId, teamId],
   );
-  if (releasedQueued) return { ok: true };
+  if (releasedQueued) {
+    await emitWebhook(teamId, 'environment.released', { requestId, wasAssigned: false });
+    return { ok: true };
+  }
 
   const request = await maybeOne<{ id: string; host_id: string; vm_id: string; vcpu: number | null; ram_mb: number | null }>(
     "SELECT id, host_id, vm_id, vcpu, ram_mb FROM environment_requests WHERE id = $1 AND team_id = $2 AND status = 'assigned'",
@@ -345,6 +396,9 @@ export async function releaseEnvironment(teamId: string, requestId: string): Pro
       'UPDATE hosts SET cpu_used = GREATEST(0, cpu_used - $1), ram_used_mb = GREATEST(0, ram_used_mb - $2) WHERE id = $3',
       [request.vcpu ?? 0, request.ram_mb ?? 0, request.host_id],
     );
+  });
+  await emitWebhook(teamId, 'environment.released', {
+    requestId, vmId: request.vm_id, wasAssigned: true,
   });
   return { ok: true };
 }

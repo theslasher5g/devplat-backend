@@ -35,6 +35,14 @@ export const config = {
   // sent. Defaults to the contact inbox; a Slack incoming-webhook URL, when
   // set, gets the same alert. Both channels are best-effort.
   opsAlertEmail: process.env.OPS_ALERT_EMAIL ?? process.env.CONTACT_EMAIL ?? 'hello@devplat.ch',
+  // DEV ONLY. Outgoing webhooks refuse to connect to anything that isn't a
+  // public unicast address, because this process sits on the WireGuard mesh and
+  // can reach every agent's unauthenticated Docker API — a customer-supplied
+  // URL pointing there would be a full host compromise. Setting this to true
+  // removes that protection so the delivery path can be tested against a local
+  // server; server.ts logs a warning when it is on, and it must never be set in
+  // production.
+  webhookAllowPrivateTargets: process.env.WEBHOOK_ALLOW_PRIVATE_TARGETS === 'true',
   slackAlertWebhookUrl: process.env.SLACK_ALERT_WEBHOOK_URL ?? '',
   // Shared secret the backup script authenticates its run reports with
   // (deploy/backup/backup.sh). Empty disables reporting entirely, which

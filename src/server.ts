@@ -16,6 +16,7 @@ import billingRoutes from './routes/billing.js';
 import contactRoutes from './routes/contact.js';
 import dataExportRoutes from './routes/dataExport.js';
 import environmentRoutes from './routes/environments.js';
+import outgoingWebhookRoutes from './routes/outgoingWebhooks.js';
 import hostRoutes from './routes/hosts.js';
 import sessionRoutes from './routes/sessions.js';
 import statusRoutes from './routes/status.js';
@@ -28,6 +29,8 @@ import webhookRoutes from './routes/webhooks.js';
 import { loadPlans } from './plans.js';
 import { startHealthPoller } from './scheduler/healthPoller.js';
 import { startQueueWorker } from './scheduler/queueWorker.js';
+import { startCapacityNoticeWorker } from './scheduler/capacityNotices.js';
+import { startWebhookWorker } from './scheduler/webhookDelivery.js';
 import { startMaintenanceWorker } from './scheduler/maintenance.js';
 import { startTrialNoticeWorker } from './scheduler/trialNotices.js';
 
@@ -191,6 +194,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(systemHealthRoutes);
   await app.register(statusRoutes);
   await app.register(environmentRoutes);
+  await app.register(outgoingWebhookRoutes);
   await app.register(tunnelRoutes);
 
   // Scheduler background loops: retry queued environment requests as
@@ -205,11 +209,24 @@ export async function buildServer(): Promise<FastifyInstance> {
   // spent verification tokens, the Stripe replay ledger) — nothing deleted
   // from them before, so they grew for the life of the deployment.
   const stopMaintenance = startMaintenanceWorker();
+  // Tells owners when their runs keep queueing behind their own parallelism
+  // cap — the upgrade signal that was previously visible to nobody.
+  const stopCapacityNotices = startCapacityNoticeWorker();
+  // Delivers queued outgoing webhooks to customer endpoints, with retries.
+  const stopWebhooks = startWebhookWorker(config.schedulerPollIntervalMs);
+  if (config.webhookAllowPrivateTargets) {
+    app.log.warn(
+      'WEBHOOK_ALLOW_PRIVATE_TARGETS is on — outgoing webhooks may reach private/loopback addresses. '
+      + 'This disables SSRF protection and must never be set in production.',
+    );
+  }
   app.addHook('onClose', async () => {
     stopQueueWorker();
     stopHealthPoller();
     stopTrialNotices();
     stopMaintenance();
+    stopCapacityNotices();
+    stopWebhooks();
   });
 
   return app;

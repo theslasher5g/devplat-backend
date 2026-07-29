@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { maybeOne, one, query } from '../db.js';
+import { capacityPressure } from '../lib/capacityPressure.js';
 import { effectivePlan, releaseEnvironment, requestEnvironment } from '../scheduler/allocator.js';
 import { requireApiTokenOrUser } from '../plugins/auth.js';
 
@@ -180,6 +181,16 @@ export default async function environmentRoutes(app: FastifyInstance): Promise<v
       [days, teamId],
     );
     return { days: res.rows.map((r) => ({ date: r.day, starts: Number(r.starts), failures: Number(r.failures) })) };
+  });
+
+  // How often this team's runs waited for a free slot. Distinct from
+  // /environments/usage, which counts starts: a start that waited ten minutes
+  // and a start that began instantly are the same row there. This is the
+  // number that says whether the plan still fits.
+  app.get('/environments/pressure', { preHandler: requireApiTokenOrUser }, async (req) => {
+    const raw = Number((req.query as { days?: string }).days ?? 14);
+    const days = Number.isFinite(raw) ? Math.max(1, Math.min(90, Math.trunc(raw))) : 14;
+    return capacityPressure(teamIdOf(req), days);
   });
 
   // Live container list for an assigned environment — powers the dashboard's

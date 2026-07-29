@@ -2,6 +2,7 @@ import { render } from '@react-email/render';
 import { Resend } from 'resend';
 import type { ReactElement } from 'react';
 import { config } from '../config.js';
+import CapacityLimit from '../emails/CapacityLimit.js';
 import ContactSubmission from '../emails/ContactSubmission.js';
 import HostOfflineAlert from '../emails/HostOfflineAlert.js';
 import PaymentFailed from '../emails/PaymentFailed.js';
@@ -124,6 +125,18 @@ export async function sendTrialEndingEmail(to: string, payload: {
     ? `Your devplat trial for ${payload.teamName} has ended`
     : `${payload.daysLeft} day${payload.daysLeft === 1 ? '' : 's'} left on your devplat trial`;
   await send(to, subject, TrialEnding({ ...payload, pricingUrl }), pricingUrl);
+}
+
+/** Tells an owner their runs are queueing behind their own parallelism cap.
+ *  Rate-limited by teams.capacity_notice_sent_at at the call site — see
+ *  scheduler/capacityNotices.ts for why the cooldown is generous. */
+export async function sendCapacityLimitEmail(to: string, payload: {
+  teamName: string; blockedRuns: number; windowDays: number; waitText: string | null;
+  currentLimit: number; upgradeLabel: string | null; upgradeParallel: number | null; upgradeChf: number | null;
+}): Promise<void> {
+  const billingUrl = `${config.frontendUrl}/app/billing`;
+  await send(to, `${payload.teamName}: test runs are waiting for a free environment`,
+    CapacityLimit({ ...payload, billingUrl }), billingUrl);
 }
 
 /** Account-security notification (new device, token created, 2FA off, ...).
