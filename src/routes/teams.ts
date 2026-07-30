@@ -1,7 +1,7 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { config, type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
-import { getPlan, maxFootprintGb } from '../plans.js';
+import { allPlans, getPlan, maxFootprintGb } from '../plans.js';
 import { resolveTtlMinutes } from '../scheduler/allocator.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { AUDIT_CSV_HEADER, auditCsvRow, auditFilters } from '../lib/auditExport.js';
@@ -65,6 +65,42 @@ async function teamCreationBlocker(
   if (owned >= MAX_OWNED_TEAMS) return 'team_limit_reached';
   if (paid === 0) return 'paid_plan_required';
   return null;
+}
+
+/**
+ * Gate for the audit-log endpoints: admin *and* on a tier that includes it.
+ *
+ * The pricing page has always listed the audit log as a Scale feature while the
+ * API gated it on role alone, so every owner and admin on every tier could read
+ * and export it. The page was describing a product that didn't exist; this is
+ * the side that was wrong.
+ *
+ * Note this gates reading, not writing. Records keep being made on every tier —
+ * they are a security trail before they are a feature, a customer upgrading to
+ * Scale should find their real history rather than a log that starts the day
+ * they paid, and GDPR requests are answered from them regardless of plan.
+ */
+async function requireAuditLogPlan(req: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+  const denied = await requireTeamAdmin(req, reply);
+  if (denied) return denied;
+  const team = await one<{ plan_tier: PlanTier }>(
+    'SELECT COALESCE(plan_override, plan_tier) AS plan_tier FROM teams WHERE id = $1',
+    [req.membership.teamId],
+  );
+  const plan = getPlan(team.plan_tier);
+  if (!plan.auditLog) {
+    // 402, not 403: the account isn't forbidden from this, it just isn't on a
+    // plan that includes it. Names the tier so the message is actionable
+    // without a trip to the pricing page.
+    const withAuditLog = allPlans().filter((p) => p.auditLog).map((p) => p.label).join(' or ');
+    reply.code(402).send({
+      error: 'plan_required_audit_log',
+      detail: `The audit log is included with ${withAuditLog || 'a higher plan'}. `
+        + `Your team is on ${plan.label}. Activity is still being recorded — upgrading makes the full history readable.`,
+    });
+    return reply;
+  }
+  return undefined;
 }
 
 /**
@@ -288,6 +324,9 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         ttlMinutes: resolveTtlMinutes(getPlan(team.plan_tier), team.environment_ttl_minutes),
         ttlDefaultMinutes: getPlan(team.plan_tier).ttlDefaultMinutes,
         ttlMaxMinutes: getPlan(team.plan_tier).ttlMaxMinutes,
+        // So the dashboard can say the audit log exists and needs a plan,
+        // rather than rendering a card that 402s the moment it loads.
+        auditLog: getPlan(team.plan_tier).auditLog,
         trialEndsAt: team.trial_ends_at,
         createdAt: team.created_at,
         myRole: req.membership.role,
@@ -319,7 +358,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   // Team activity log — visible to team admins/owners. Shows this team's own
   // audit trail (tokens, members, renames, and any admin plan override applied
   // to it), newest first.
-  app.get('/teams/me/audit', { preHandler: requireTeamAdmin }, async (req) => {
+  app.get('/teams/me/audit', { preHandler: requireAuditLogPlan }, async (req) => {
     const f = auditFilters(req.query as Record<string, string | undefined>);
     const res = await query<AuditRow>(
       `SELECT id, action, target, actor_email, detail, created_at, team_id
@@ -347,7 +386,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
 
   // The distinct actions this team has actually recorded, so the UI can offer a
   // filter dropdown of real values instead of a hardcoded guess.
-  app.get('/teams/me/audit/actions', { preHandler: requireTeamAdmin }, async (req) => {
+  app.get('/teams/me/audit/actions', { preHandler: requireAuditLogPlan }, async (req) => {
     const res = await query<{ action: string }>(
       'SELECT DISTINCT action FROM audit_log WHERE team_id = $1 ORDER BY action',
       [req.membership.teamId],
@@ -358,7 +397,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   // Export the (filtered) trail. Compliance reviews ask for the whole record as
   // a file, not a paginated screen — CSV for spreadsheets, JSON for tooling.
   app.get('/teams/me/audit/export', {
-    preHandler: requireTeamAdmin,
+    preHandler: requireAuditLogPlan,
     config: { rateLimit: { max: 10, timeWindow: '1 hour' } },
   }, async (req, reply) => {
     const q = req.query as Record<string, string | undefined>;

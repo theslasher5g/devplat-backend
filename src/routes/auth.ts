@@ -379,10 +379,25 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
     // planTier here is the effective entitlement tier (a manual plan_override
     // if set, else the billing plan_tier), so the dashboard reflects what the
     // team can actually use. Billing/subscription state is under /billing.
+    // Ordering must match requireMember's exactly: active_team_id first, then
+    // the oldest membership as the fallback.
+    //
+    // This used to be `ORDER BY tm.created_at LIMIT 1` — it ignored
+    // active_team_id entirely and always answered with the user's oldest team,
+    // whichever one they had actually switched to. That made /auth/me a third,
+    // disagreeing opinion on "which team am I in", next to requireMember's and
+    // /teams'. Switching teams left this response unchanged, so anything
+    // reading me.team — the plan tier, the trial countdown, and the key that
+    // tells the dashboard to reload its cards — silently kept describing a
+    // different team than the one the API was operating on.
     const membership = await maybeOne<{ team_id: string; role: string; name: string; plan_tier: string; trial_ends_at: string }>(
       `SELECT tm.team_id, tm.role, t.name, COALESCE(t.plan_override, t.plan_tier) AS plan_tier, t.trial_ends_at
-       FROM team_members tm JOIN teams t ON t.id = tm.team_id
-       WHERE tm.user_id = $1 ORDER BY tm.created_at LIMIT 1`,
+       FROM team_members tm
+       JOIN teams t ON t.id = tm.team_id
+       LEFT JOIN users u ON u.id = tm.user_id
+       WHERE tm.user_id = $1
+       ORDER BY (tm.team_id = u.active_team_id) DESC, tm.created_at
+       LIMIT 1`,
       [req.user.id],
     );
     return {

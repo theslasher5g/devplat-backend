@@ -25,6 +25,9 @@ export interface Plan {
   /** Highest TTL this tier may be raised to. Equal to the default on tiers
    *  where the TTL is fixed, which is how "not configurable" is expressed. */
   ttlMaxMinutes: number;
+  /** Whether this tier may READ its audit log. Records are written on every
+   *  tier regardless — see migration 037 for why. */
+  auditLog: boolean;
 }
 
 const TIER_ORDER: PlanTier[] = ['free', 'solo', 'team', 'scale'];
@@ -38,10 +41,11 @@ export async function loadPlans(): Promise<void> {
     ram_gb_per_environment: number; trial_duration_days: number | null;
     max_members: number | null;
     ttl_default_minutes: number; ttl_max_minutes: number;
+    audit_log: boolean;
   }>(
     `SELECT id, name, price_chf_monthly, max_parallel_environments,
             vcpu_per_environment, ram_gb_per_environment, trial_duration_days,
-            max_members, ttl_default_minutes, ttl_max_minutes
+            max_members, ttl_default_minutes, ttl_max_minutes, audit_log
      FROM plans`,
   );
   const map = {} as Record<PlanTier, Plan>;
@@ -57,6 +61,7 @@ export async function loadPlans(): Promise<void> {
       maxMembers: r.max_members,
       ttlDefaultMinutes: r.ttl_default_minutes,
       ttlMaxMinutes: r.ttl_max_minutes,
+      auditLog: r.audit_log,
     };
   }
   for (const tier of TIER_ORDER) {

@@ -161,6 +161,31 @@ Nothing acts on any of this yet. It exists so an overcommit factor can be sized
 from evidence rather than estimated, and so placement can later be ordered by
 real load.
 
+### Which team am I in
+
+Three places answer this and they must agree: `requireMember` (what the API acts
+on), `GET /teams` (what the switcher marks as current), and `GET /auth/me` (what
+the dashboard keys its cards on). All three now order by
+`(tm.team_id = u.active_team_id) DESC, tm.created_at` — the team last switched
+to, falling back to the oldest membership.
+
+`/auth/me` used to be `ORDER BY tm.created_at LIMIT 1`, ignoring
+active_team_id entirely and always answering with the oldest team. Switching
+teams left that response unchanged, so the plan tier, the trial countdown and
+the dashboard's reload key all kept describing a team the API had stopped
+operating on.
+
+### The audit log is a Scale entitlement
+
+Reading and exporting the trail requires a plan with `plans.audit_log` (Scale
+today), on top of the existing admin role — the pricing page had always said so
+while the API gated on role alone.
+
+Records keep being written on every tier. They are a security trail before they
+are a feature, a customer upgrading should find their real history rather than a
+log starting the day they paid, and GDPR requests are answered from them
+regardless of plan.
+
 ### The free trial is per user, not per team
 
 `POST /teams` used to give every new team a fresh 14-day trial with no cap on
