@@ -1,0 +1,18 @@
+-- Solo drops to one parallel environment.
+--
+-- Parallelism is the pricing axis, so this is a real reduction, not a
+-- relabelling: a Solo team that could run two test suites at once now runs one
+-- and queues the second. The scheduler enforces it from this row (see
+-- plans.max_parallel_environments and scheduler/allocator.ts), so it takes
+-- effect for existing teams the moment the plans cache reloads — no per-team
+-- migration and no grandfathering.
+--
+-- If anyone is already paying for Solo, they lose half the concurrency they
+-- bought. That is a deliberate product decision, recorded here so it is not
+-- mistaken later for a typo.
+--
+-- What still separates Solo from Free after this: Free is time-boxed to 14 days
+-- and capped at 1 vCPU / 2 GB per environment; Solo has no expiry and doubles
+-- the per-environment size. The difference is the size of the box and the fact
+-- that it doesn't disappear, not how many boxes.
+UPDATE plans SET max_parallel_environments = 1 WHERE id = 'solo';
