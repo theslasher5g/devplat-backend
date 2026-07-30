@@ -125,6 +125,12 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
           cpuBusyPct: { type: 'integer', minimum: 0, maximum: 100 },
           cpuUsedVcpu: { type: 'number', minimum: 0 },
           throttledVms: { type: 'integer', minimum: 0 },
+          // Overcommit setting and its cost — see migration 041. Reported on
+          // every heartbeat rather than only alongside a complete memory
+          // sample: a starved grant is most worth seeing exactly when the host
+          // is in the state that stops its guests reporting cleanly.
+          overcommitPct: { type: 'integer', minimum: 100, maximum: 1000 },
+          starvedGrants: { type: 'integer', minimum: 0 },
         },
       },
     },
@@ -132,12 +138,13 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
     const {
       cpuUsed, ramUsedMb, draining, cacheLookups, cacheHits,
       ramCommittedMb, ramGrantedMb, ramGuestUsedMb, hostAvailableMb,
-      cpuBusyPct, cpuUsedVcpu, throttledVms,
+      cpuBusyPct, cpuUsedVcpu, throttledVms, overcommitPct, starvedGrants,
     } = req.body as {
       cpuUsed: number; ramUsedMb: number; activeVmCount: number; draining?: boolean;
       cacheLookups?: number; cacheHits?: number;
       ramCommittedMb?: number; ramGrantedMb?: number; ramGuestUsedMb?: number; hostAvailableMb?: number;
       cpuBusyPct?: number; cpuUsedVcpu?: number; throttledVms?: number;
+      overcommitPct?: number; starvedGrants?: number;
     };
     // Cache counters are optional (absent when the host's registry debug
     // endpoint is off). COALESCE keeps the last known values instead of
@@ -161,13 +168,22 @@ export default async function hostRoutes(app: FastifyInstance): Promise<void> {
               cpu_busy_pct = COALESCE($10, cpu_busy_pct),
               cpu_used_actual = COALESCE($11, cpu_used_actual),
               cpu_throttled_vms = COALESCE($12, cpu_throttled_vms),
-              usage_reported_at = CASE WHEN $13 THEN now() ELSE usage_reported_at END
-       WHERE id = $14`,
+              usage_reported_at = CASE WHEN $13 THEN now() ELSE usage_reported_at END,
+              overcommit_pct = COALESCE($14, overcommit_pct),
+              starved_grants = COALESCE($15, starved_grants),
+              -- Stamped only when the count actually went up. The counter is
+              -- cumulative for the life of the agent process, so a host that
+              -- starved someone once during a spike last week would otherwise
+              -- look identical to one starving guests this minute.
+              starved_grants_at = CASE
+                WHEN $15::bigint IS NOT NULL AND $15::bigint > COALESCE(starved_grants, 0)
+                THEN now() ELSE starved_grants_at END
+       WHERE id = $16`,
       [
         cpuUsed, ramUsedMb, draining ? 'draining' : 'online', cacheLookups ?? null, cacheHits ?? null,
         ramCommittedMb ?? null, ramGrantedMb ?? null, ramGuestUsedMb ?? null, hostAvailableMb ?? null,
         cpuBusyPct ?? null, cpuUsedVcpu ?? null, throttledVms ?? null,
-        measured, req.hostId,
+        measured, overcommitPct ?? null, starvedGrants ?? null, req.hostId,
       ],
     );
     return { ok: true };

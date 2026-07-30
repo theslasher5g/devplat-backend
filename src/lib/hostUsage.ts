@@ -32,6 +32,9 @@ export interface HostUsageColumns {
   cpu_used_actual: string | number | null;
   cpu_throttled_vms: number | null;
   usage_reported_at: string | Date | null;
+  overcommit_pct: number | null;
+  starved_grants: string | number | null;
+  starved_grants_at: string | Date | null;
 }
 
 export interface HostUsage {
@@ -85,4 +88,49 @@ export function presentHostUsage(row: HostUsageColumns, now = Date.now()): HostU
 /** The columns every reader of host usage needs, so the list doesn't drift
  *  between queries. */
 export const HOST_USAGE_COLUMNS = `ram_committed_mb, ram_granted_mb, ram_guest_used_mb,
-  ram_host_available_mb, cpu_busy_pct, cpu_used_actual, cpu_throttled_vms, usage_reported_at`;
+  ram_host_available_mb, cpu_busy_pct, cpu_used_actual, cpu_throttled_vms, usage_reported_at,
+  overcommit_pct, starved_grants, starved_grants_at`;
+
+/**
+ * The host's overcommit setting and what it has cost.
+ *
+ * Deliberately separate from HostUsage rather than a few more fields on it.
+ * They answer different questions and, critically, they arrive on different
+ * conditions: a usage sample is withheld until every guest has reported,
+ * because a partial sum is a misleading capacity input, while the ratio is a
+ * host setting and a starved grant is a promise that was broken.
+ *
+ * Folding them together had a specific bad consequence, found by the
+ * verification script rather than by reading: a host reporting starvation but
+ * no clean memory sample produced no usage block at all, so the one number that
+ * says "this host is failing its customers right now" was hidden by exactly the
+ * conditions that produce it. The alternative — letting an overcommit report
+ * stamp usage_reported_at — would have been worse, since the scheduler now
+ * places against that timestamp and would have treated a host with no CPU or
+ * memory data as freshly measured.
+ */
+export interface HostOvercommit {
+  /** Percentage of physical RAM this host may promise. 100 means it promises
+   *  only what it has. Never fabricated: a host that has not reported one is
+   *  absent from the response entirely rather than shown as 100. */
+  pct: number;
+  /** Times a guest under memory pressure was refused memory it had already been
+   *  promised. Above zero means this ratio is too high for what these customers
+   *  actually do. Resets when the agent process restarts. */
+  starvedGrants: number | null;
+  /** When that count last increased — a spike last month and starvation this
+   *  minute are different problems and must not read the same. */
+  starvedAt: string | null;
+}
+
+export function presentHostOvercommit(row: HostUsageColumns): HostOvercommit | null {
+  const pct = toNumber(row.overcommit_pct);
+  if (pct === null) return null;
+  return {
+    pct,
+    starvedGrants: toNumber(row.starved_grants),
+    starvedAt: row.starved_grants_at
+      ? (row.starved_grants_at instanceof Date ? row.starved_grants_at : new Date(row.starved_grants_at)).toISOString()
+      : null,
+  };
+}

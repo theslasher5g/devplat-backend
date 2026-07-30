@@ -2,11 +2,17 @@ import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { type Plan, getPlan } from '../plans.js';
 import { emitWebhook } from '../lib/webhooks.js';
-import { AgentError, clientForHost, hostFits, hostFreeCpu } from './agentClient.js';
+import { AgentError, clientForHost, hostFits } from './agentClient.js';
+import { rankHosts } from './placement.js';
 
 export interface HostRow {
   id: string; name: string; agent_endpoint: string | null; agent_token: string | null;
   cpu_total: number; cpu_used: number; ram_total_mb: number; ram_used_mb: number; status: string;
+  // Measured, for placement. Null on a host that has never reported — see
+  // placement.ts for why that must not read as "idle".
+  cpu_busy_pct?: number | null;
+  ram_host_available_mb?: number | null;
+  usage_reported_at?: string | Date | null;
 }
 
 export interface EnvironmentResult {
@@ -157,17 +163,17 @@ export async function effectivePlan(teamId: string): Promise<EffectivePlan> {
   };
 }
 
-/** Hosts that can fit a VM of the given size, most-free-CPU first. Excludes
- *  hosts an admin has marked to drain (they keep their existing VMs but take
- *  no new ones). */
+/** Hosts that can fit a VM of the given size, emptiest first — by what the
+ *  machines are actually doing where that is known, and by their reservations
+ *  where it is not (see scheduler/placement.ts). Excludes hosts an admin has
+ *  marked to drain (they keep their existing VMs but take no new ones). */
 async function candidateHosts(vcpu: number, ramMb: number): Promise<HostRow[]> {
   const res = await query<HostRow>(
-    `SELECT id, name, agent_endpoint, agent_token, cpu_total, cpu_used, ram_total_mb, ram_used_mb, status
+    `SELECT id, name, agent_endpoint, agent_token, cpu_total, cpu_used, ram_total_mb, ram_used_mb, status,
+            cpu_busy_pct, ram_host_available_mb, usage_reported_at
      FROM hosts WHERE status = 'online' AND drain = false AND agent_endpoint IS NOT NULL AND agent_token IS NOT NULL`,
   );
-  return res.rows
-    .filter((h) => hostFits(h, vcpu, ramMb))
-    .sort((a, b) => hostFreeCpu(b) - hostFreeCpu(a) || a.name.localeCompare(b.name));
+  return rankHosts(res.rows, vcpu, ramMb);
 }
 
 /** Try to place a queued request on the best available host. Tries hosts in

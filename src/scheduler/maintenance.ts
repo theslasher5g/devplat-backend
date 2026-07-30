@@ -48,11 +48,61 @@ export async function runMaintenance(): Promise<void> {
      WHERE resolved_at IS NOT NULL AND last_seen_at < now() - interval '90 days'`,
   );
 
-  const total = (sessions.rowCount ?? 0) + (tokens.rowCount ?? 0) + (events.rowCount ?? 0) + (errors.rowCount ?? 0);
+  // A delivered webhook is read from exactly one place — the delivery log in
+  // Settings, which shows the newest 100 and renders 20. It carries the full
+  // event payload as jsonb, and one row is written per event per endpoint, so
+  // this is the fastest-growing table in the schema and the one nothing was
+  // deleting from.
+  //
+  // Failed deliveries get three months rather than one: they are the rows
+  // someone actually comes back to ("why did our Slack hook stop in March"),
+  // and a permanently failed endpoint is disabled after 10 attempts inside
+  // about a day and a half, so nothing still being retried is ever in scope.
+  const webhooks = await query(
+    `DELETE FROM webhook_deliveries
+     WHERE (status = 'delivered' AND created_at < now() - interval '30 days')
+        OR (status = 'failed'    AND created_at < now() - interval '90 days')`,
+  );
+
+  // Metering data. The privacy policy commits to this in writing — "Usage/
+  // metering records are kept for 24 months for billing accuracy and capacity
+  // planning, then deleted" — and nothing was deleting them, so the promise was
+  // being broken by omission rather than by choice. The widest window any
+  // endpoint can ask for is 90 days (environments.ts clamps `days` to 90), so
+  // 24 months is eight times past anything readable.
+  const usage = await query(
+    `DELETE FROM usage_events WHERE occurred_at < now() - interval '24 months'`,
+  );
+
+  // The run history behind that metering. Only terminal rows: a queued or
+  // assigned row is a live environment, and COALESCE picks the moment the row
+  // stopped changing, so a long-running environment is aged from its release
+  // and not from its request.
+  //
+  // The `requested_at` term is redundant against the COALESCE — released_at is
+  // never earlier than requested_at, so anything the COALESCE matches this also
+  // matches — but it is what lets the planner use the index instead of reading
+  // the whole table to find the handful of rows that aged out today.
+  const runs = await query(
+    `DELETE FROM environment_requests
+     WHERE status IN ('released', 'failed')
+       AND requested_at < now() - interval '24 months'
+       AND COALESCE(released_at, requested_at) < now() - interval '24 months'`,
+  );
+
+  // Deliberately absent: audit_log. The privacy policy keeps account and team
+  // data "while your account is active", Scale sells the trail as a feature,
+  // and it is what a customer hands an auditor — a silent cutoff would delete
+  // the evidence someone is paying to still have. It goes when the team goes,
+  // via ON DELETE CASCADE, and not before.
+
+  const total = (sessions.rowCount ?? 0) + (tokens.rowCount ?? 0) + (events.rowCount ?? 0)
+    + (errors.rowCount ?? 0) + (webhooks.rowCount ?? 0) + (usage.rowCount ?? 0) + (runs.rowCount ?? 0);
   if (total > 0) {
     console.log(
       `[maintenance] pruned ${sessions.rowCount} sessions, ${tokens.rowCount} verification tokens, `
-      + `${events.rowCount} stripe events, ${errors.rowCount} resolved errors`,
+      + `${events.rowCount} stripe events, ${errors.rowCount} resolved errors, `
+      + `${webhooks.rowCount} webhook deliveries, ${usage.rowCount} usage events, ${runs.rowCount} run records`,
     );
   }
 }

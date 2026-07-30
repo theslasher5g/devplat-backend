@@ -3,7 +3,7 @@ import { config, type PlanTier } from '../config.js';
 import { getPlan } from '../plans.js';
 import { maybeOne, query, withTransaction } from '../db.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
-import { HOST_USAGE_COLUMNS, type HostUsageColumns, presentHostUsage } from '../lib/hostUsage.js';
+import { HOST_USAGE_COLUMNS, type HostUsageColumns, presentHostOvercommit, presentHostUsage } from '../lib/hostUsage.js';
 import { clientForHost } from '../scheduler/agentClient.js';
 import { notifyTwoFactorResetByAdmin } from '../lib/securityEvents.js';
 import { stripe } from '../lib/stripe.js';
@@ -61,6 +61,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         cpu: { total: h.cpu_total, used: h.cpu_used },
         ramMb: { total: h.ram_total_mb, used: h.ram_used_mb },
         usage: presentHostUsage(h),
+        overcommit: presentHostOvercommit(h),
       })),
     };
   });
@@ -124,6 +125,7 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         ramMb: { total: h.ram_total_mb, used: h.ram_used_mb },
         cacheHitRate: lookups && lookups > 0 && hits !== null ? hits / lookups : null,
         usage: presentHostUsage(h),
+        overcommit: presentHostOvercommit(h),
       },
       environments: envs.rows.map((e) => {
         const live = e.vm_id ? byVmId.get(e.vm_id) : undefined;

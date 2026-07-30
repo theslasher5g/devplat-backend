@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { USAGE_STALE_AFTER_MS, presentHostUsage } from '../src/lib/hostUsage.js';
+import { USAGE_STALE_AFTER_MS, presentHostOvercommit, presentHostUsage } from '../src/lib/hostUsage.js';
 
 /**
  * "Is this measurement usable" is the rule that decides whether a host looks
@@ -21,6 +21,9 @@ function columns(overrides: Record<string, unknown> = {}) {
     cpu_used_actual: '2.75',
     cpu_throttled_vms: 1,
     usage_reported_at: new Date(NOW - 5_000).toISOString(),
+    overcommit_pct: null,
+    starved_grants: null,
+    starved_grants_at: null,
     ...overrides,
   } as Parameters<typeof presentHostUsage>[0];
 }
@@ -107,4 +110,63 @@ test('partially reported usage keeps the fields that exist', () => {
   assert.ok(u);
   assert.equal(u.ramGuestUsedMb, null);
   assert.equal(u.cpuBusyPct, 35);
+});
+
+/**
+ * Overcommit reporting (migration 041).
+ *
+ * Presented separately from the usage sample on purpose. The two arrive on
+ * different conditions — a usage sample waits for every guest to report, a
+ * starved grant is a broken promise — and folding them together hid the alarm
+ * on exactly the hosts raising it.
+ */
+
+test('a host that never reported an overcommit setting is absent, not assumed to be 100', () => {
+  // An older agent has no opinion about its ratio. Rendering it as "100%, not
+  // overcommitted" would be inventing a fact about a production host.
+  assert.equal(presentHostOvercommit(columns({ overcommit_pct: null })), null);
+});
+
+test('a measured zero is not collapsed into "never reported"', () => {
+  // "This host has never starved anyone" and "we have no idea whether it has"
+  // justify opposite decisions about raising its ratio.
+  const o = presentHostOvercommit(columns({ overcommit_pct: 150, starved_grants: 0 }));
+  assert.ok(o);
+  assert.equal(o.pct, 150);
+  assert.equal(o.starvedGrants, 0);
+  assert.notEqual(o.starvedGrants, null);
+});
+
+test('a ratio with an unreported counter keeps the counter unknown', () => {
+  const o = presentHostOvercommit(columns({ overcommit_pct: 100, starved_grants: null }));
+  assert.ok(o);
+  assert.equal(o.pct, 100);
+  assert.equal(o.starvedGrants, null);
+});
+
+test('starvation is reported with when it last happened', () => {
+  const at = new Date(NOW - 60_000).toISOString();
+  const o = presentHostOvercommit(columns({
+    overcommit_pct: 200, starved_grants: 47, starved_grants_at: at,
+  }));
+  assert.ok(o);
+  assert.equal(o.starvedGrants, 47);
+  assert.equal(o.starvedAt, at);
+});
+
+test('a bigint counter arriving as a string is converted', () => {
+  // node-postgres hands bigint back as a string to avoid losing precision;
+  // left alone it would render as text and compare wrongly against 0.
+  const o = presentHostOvercommit(columns({ overcommit_pct: 150, starved_grants: '9007199254' }));
+  assert.ok(o);
+  assert.equal(typeof o.starvedGrants, 'number');
+  assert.equal(o.starvedGrants, 9_007_199_254);
+});
+
+test('overcommit survives a host with no usable usage sample at all', () => {
+  // The reason these are separate functions. A host whose guests never reported
+  // has no usage block — and that is precisely a host worth hearing from.
+  const c = columns({ usage_reported_at: null, overcommit_pct: 150, starved_grants: 8 });
+  assert.equal(presentHostUsage(c, NOW), null);
+  assert.equal(presentHostOvercommit(c)?.starvedGrants, 8);
 });
