@@ -183,12 +183,26 @@ RETURNING (trial_started_at = now())`. `now()` is the transaction timestamp, so
 equality is true exactly when *this* call consumed it, and the lock serialises
 concurrent creates from the same account.
 
-Capping team count alone would only have raised the price of the trick; binding
-the trial removes the reason to try. The cap (5 owned teams) stays as hygiene
-against audit noise and invite spam from a compromised account.
+That alone closed the billing hole but left a worse experience: a dead team in
+the switcher that could not start anything, with no explanation until someone
+tried. So creating a *second* team is now a paid feature outright —
+`teamCreationBlocker()` refuses with 402 `paid_plan_required` unless at least one
+team the user owns is on a paid tier (a manual `plan_override` counts). The
+refusal says the thing at the moment it can still be acted on.
 
-Being invited into someone else's team consumes nothing — that person still has
-their own trial if they later start a team themselves.
+Two rules that must not be lost:
+
+- Someone who owns **no** team can always create one, or anyone who left or was
+  removed from their only team would be stranded on a dead account.
+- **Joining** a team you were invited to never touches any of this, and neither
+  does switching between teams. Being a member of someone else's paid team does
+  not unlock creating your own — membership isn't ownership.
+
+The 5-team cap stays on top as hygiene against audit noise and invite spam from
+a compromised account.
+
+Being invited into someone else's team consumes no trial — that person still has
+their own if they later start a team themselves.
 
 Note the honest limit: this stops one account minting trials. It does not stop
 someone registering several accounts with different addresses. Email

@@ -23,9 +23,49 @@ import { SESSION_COOKIE, requireApiTokenOrUser, requireMember, requireTeamAdmin,
  */
 const MAX_OWNED_TEAMS = 5;
 
-/** Thrown inside the create-team transaction so the cap check rolls back
+/** Thrown inside the create-team transaction so a refused check rolls back
  *  everything with it, rather than leaving a half-made team behind. */
 class TeamLimitReached extends Error {}
+class PaidPlanRequired extends Error {}
+
+/**
+ * Whether this user may create another team, and why not.
+ *
+ * The rule is that a *second* team is a paid feature. Someone with no team at
+ * all can always make one — otherwise anyone who left or was removed from their
+ * only team would be stranded — and a customer with a paid team can run several.
+ * What isn't allowed is a free account creating a second team.
+ *
+ * The earlier fix here bound the trial to the user, so a second team came into
+ * existence already expired. That closed the billing hole but left a worse
+ * experience behind: a dead team sitting in the switcher that cannot start
+ * anything, with no explanation until someone tries. Refusing the creation says
+ * the same thing at the moment it can still be acted on. Joining a team you were
+ * invited to is unaffected — that path never touches this.
+ *
+ * "Paid" is the effective tier, so a manually granted plan_override counts.
+ * Callers must hold the user's row lock (see the create handler) for the counts
+ * to be safe against concurrent creates.
+ */
+async function teamCreationBlocker(
+  tx: { query: <T extends object>(sql: string, params: unknown[]) => Promise<{ rows: T[] }> },
+  userId: string,
+): Promise<'team_limit_reached' | 'paid_plan_required' | null> {
+  const counts = await tx.query<{ owned: string; paid: string }>(
+    `SELECT count(*) AS owned,
+            count(*) FILTER (WHERE COALESCE(t.plan_override, t.plan_tier) <> 'free') AS paid
+     FROM team_members tm JOIN teams t ON t.id = tm.team_id
+     WHERE tm.user_id = $1 AND tm.role = 'owner'`,
+    [userId],
+  );
+  const owned = Number(counts.rows[0].owned);
+  const paid = Number(counts.rows[0].paid);
+
+  if (owned === 0) return null; // never strand an account with no team
+  if (owned >= MAX_OWNED_TEAMS) return 'team_limit_reached';
+  if (paid === 0) return 'paid_plan_required';
+  return null;
+}
 
 /**
  * Seat cap check for a team's tier. Counts current members plus outstanding
@@ -89,18 +129,23 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     // API is actually operating on when nothing has been chosen yet.
     if (teams.length > 0 && !teams.some((t) => t.active)) teams[0].active = true;
 
-    // Told to the UI so the create-team dialog can say up front what the new
-    // team will be, rather than letting someone make one and discover it can't
-    // start an environment. The trial is once per person; a second team begins
-    // on a paid plan or not at all.
-    const me = await one<{ trial_used: boolean }>(
-      'SELECT (trial_started_at IS NOT NULL) AS trial_used FROM users WHERE id = $1', [req.user.id],
-    );
+    // The create rule is answered here rather than re-derived in the UI, so the
+    // button and the endpoint can't drift apart. Same function the POST uses.
+    const [me, blocked] = await Promise.all([
+      one<{ trial_used: boolean }>(
+        'SELECT (trial_started_at IS NOT NULL) AS trial_used FROM users WHERE id = $1', [req.user.id],
+      ),
+      // Read-only here, so no row lock: this is for rendering, and the POST
+      // re-checks under a lock before it commits to anything.
+      teamCreationBlocker({ query: (sql, params) => query(sql, params) }, req.user.id),
+    ]);
     return {
       teams,
       trialAvailable: !me.trial_used,
       ownedTeams: teams.filter((t) => t.role === 'owner').length,
       maxOwnedTeams: MAX_OWNED_TEAMS,
+      canCreateTeam: blocked === null,
+      createBlockedReason: blocked,
     };
   });
 
@@ -133,28 +178,25 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     let teamId: string;
     try {
       teamId = await withTransaction(async (tx) => {
-        // Claim the trial and take the user's row lock in one statement.
-        //
-        // COALESCE means the value only moves the first time; comparing the
-        // result to now() then says whether THIS call was the one that consumed
-        // it, because now() is the transaction timestamp and any earlier claim
-        // carries a different one. The UPDATE also locks the row, so two
-        // simultaneous create requests from the same account serialise here
-        // instead of both seeing NULL and both granting a trial.
+        // Lock the user's row first. Everything below counts that user's teams,
+        // so without this a burst of concurrent creates would each read the same
+        // pre-create counts and all pass.
+        await tx.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [req.user.id]);
+
+        const blocked = await teamCreationBlocker(tx, req.user.id);
+        if (blocked === 'team_limit_reached') throw new TeamLimitReached();
+        if (blocked === 'paid_plan_required') throw new PaidPlanRequired();
+
+        // Claim the trial. COALESCE means the value only moves the first time;
+        // comparing the result to now() then says whether THIS call was the one
+        // that consumed it, because now() is the transaction timestamp and any
+        // earlier claim carries a different one.
         const claim = await tx.query<{ granted: boolean }>(
           `UPDATE users SET trial_started_at = COALESCE(trial_started_at, now())
            WHERE id = $1 RETURNING (trial_started_at = now()) AS granted`,
           [req.user.id],
         );
         trialGranted = claim.rows[0]?.granted === true;
-
-        // Counted after the lock above, so a burst of concurrent creates can't
-        // each read the same under-limit count and all proceed.
-        const owned = await tx.query<{ count: string }>(
-          "SELECT count(*) FROM team_members WHERE user_id = $1 AND role = 'owner'",
-          [req.user.id],
-        );
-        if (Number(owned.rows[0].count) >= MAX_OWNED_TEAMS) throw new TeamLimitReached();
 
         // A team created by someone who has already used their trial starts
         // already expired rather than with no trial column set: effectivePlan()
@@ -179,6 +221,17 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(409).send({
           error: 'team_limit_reached',
           detail: `You can own up to ${MAX_OWNED_TEAMS} teams. Leave or delete one first, or write to us if you genuinely need more.`,
+        });
+      }
+      if (err instanceof PaidPlanRequired) {
+        // 402 rather than 403: nothing is forbidden about this account, a plan
+        // is simply needed. Says explicitly that joining is still open, because
+        // the common case behind this is someone who was invited elsewhere and
+        // reached for "create" out of habit.
+        return reply.code(402).send({
+          error: 'paid_plan_required',
+          detail: 'Running more than one team needs a paid plan. Your current team can be upgraded '
+            + 'under Billing. You can still be invited to other teams and switch between them at any time.',
         });
       }
       throw err;
