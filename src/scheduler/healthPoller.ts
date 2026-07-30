@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { query } from '../db.js';
 import { SchedulerLock, lockedTick } from '../lib/advisoryLock.js';
-import { sendHostOfflineAlert } from '../lib/alerts.js';
+import { sendHostOfflineAlert, sendOpsAlert } from '../lib/alerts.js';
 import { recordComponentStatuses } from '../lib/status.js';
 import { clientForHost } from './agentClient.js';
 
@@ -79,6 +79,65 @@ export async function pollHostHealth(): Promise<void> {
   }));
 }
 
+/**
+ * How recently a host must have starved a guest to count as "starving now".
+ *
+ * The counter is cumulative, so without a recency window a host that had one
+ * bad afternoon three weeks ago would keep qualifying forever.
+ */
+const STARVATION_RECENT_MS = 10 * 60_000;
+
+/**
+ * How long before the same host may alert again.
+ *
+ * Six hours, matching the error tracker's re-alert window. The tension is real
+ * in both directions: alert once per episode and a host that starts starving
+ * guests worse an hour later says nothing, while alerting per occurrence turns
+ * one bad host into a full inbox, which is how alerts get filtered into a
+ * folder and stop working entirely.
+ */
+const STARVATION_REALERT_MS = 6 * 3_600_000;
+
+/**
+ * Mail about hosts that could not keep the memory promises they sold.
+ *
+ * The counter this reads exists so an overcommit ratio set too high is visible
+ * rather than inferred — but visible on a dashboard is not the same as noticed.
+ * Nobody has the admin host view open at the moment a build slows down, and the
+ * customer-side symptom ("it felt slower today") never arrives as a bug report.
+ *
+ * The claim and the selection are one statement, so several scheduler instances
+ * racing here produce one mail rather than one each — the same trick as the
+ * offline alert, and as the error tracker's alerted_at = now() test.
+ */
+export async function alertOnStarvation(): Promise<void> {
+  const claimed = await query<{
+    name: string; location: string; starved_grants: string; overcommit_pct: number | null;
+  }>(
+    `UPDATE hosts SET starvation_alerted_at = now()
+     WHERE starved_grants > 0
+       AND starved_grants_at > now() - ($1::int * interval '1 millisecond')
+       AND (starvation_alerted_at IS NULL
+            OR starvation_alerted_at < now() - ($2::int * interval '1 millisecond'))
+     RETURNING name, location, starved_grants, overcommit_pct`,
+    [STARVATION_RECENT_MS, STARVATION_REALERT_MS],
+  );
+
+  for (const h of claimed.rows) {
+    await sendOpsAlert(
+      `Host ${h.name} is starving guests of promised memory`,
+      `${h.name} (${h.location}) promises ${h.overcommit_pct ?? '?'}% of its physical RAM and has now refused `
+      + `memory to a guest ${h.starved_grants} time(s) — memory that customer's plan entitles them to and `
+      + 'they are paying for.\n\n'
+      + 'Nothing has crashed. The visible effect is builds on that host running slower than the plan promises, '
+      + 'which no customer will report as a bug.\n\n'
+      + `Lower RAM_OVERCOMMIT_PCT on ${h.name} and restart the agent. The admin host view shows the measured `
+      + 'memory this ratio was meant to be justified by.',
+      ':warning:',
+    ).catch((err: unknown) => console.error('[scheduler] starvation alert failed', err));
+  }
+}
+
 export function startHealthPoller(intervalMs: number): () => void {
   // Reconcile host health first, then snapshot any derived-status change into
   // the status history. Chained so the recording sees the freshly-updated
@@ -88,6 +147,7 @@ export function startHealthPoller(intervalMs: number): () => void {
     lockedTick('health poll', SchedulerLock.healthPoller, async () => {
       await pollHostHealth();
       await recordComponentStatuses();
+      await alertOnStarvation();
     }),
     intervalMs,
   );

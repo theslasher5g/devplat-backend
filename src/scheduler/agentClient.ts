@@ -169,14 +169,8 @@ export function clientForHost(host: { agent_endpoint: string | null; agent_token
   return new AgentClient(host.agent_endpoint, host.agent_token);
 }
 
-interface HostCapacity { cpu_total: number; cpu_used: number; ram_total_mb: number; ram_used_mb: number }
-
-/** Raw free CPU/RAM on a host. VMs are now variable-sized (per the requesting
- *  team's plan), so capacity is tracked as raw resources, not fixed slots. */
-export function hostFreeCpu(host: HostCapacity): number { return host.cpu_total - host.cpu_used; }
-export function hostFreeRamMb(host: HostCapacity): number { return host.ram_total_mb - host.ram_used_mb; }
-
-/** Whether a host has room for a VM of the given size. */
-export function hostFits(host: HostCapacity, vcpu: number, ramMb: number): boolean {
-  return hostFreeCpu(host) >= vcpu && hostFreeRamMb(host) >= ramMb;
-}
+// Free-capacity and fit helpers used to live here. They now live in
+// scheduler/placement.ts, beside the ranking that consumes them, because two
+// copies of "does this host have room" is the precise failure placement.ts
+// warns about: a host judged to have room by one caller and not by another
+// produces a scheduling bug that reproduces nowhere.

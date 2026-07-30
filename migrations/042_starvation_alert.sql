@@ -1,0 +1,16 @@
+-- Alert claim for memory starvation on an overcommitted host.
+--
+-- migration 041 records that a host could not keep a memory promise. Recording
+-- it is not the same as anyone finding out: the counter lives in the admin host
+-- view, and a number that only exists on a screen nobody has open changes
+-- nothing. This column is what lets the health poller mail about it exactly
+-- once per episode instead of on every tick.
+--
+-- Same shape as hosts.offline_alerted_at: the poller claims the alert by
+-- setting this in the same statement that selects the row, so N scheduler
+-- instances racing produce one mail, not N. It differs in how it clears —
+-- offline_alerted_at is reset by a healthy poll, while this one is allowed to
+-- age out, so a host that starves guests all afternoon mails a few times rather
+-- than either once (and then goes quiet on a worsening problem) or every five
+-- seconds.
+ALTER TABLE hosts ADD COLUMN IF NOT EXISTS starvation_alerted_at timestamptz;

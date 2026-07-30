@@ -2,7 +2,7 @@ import { type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
 import { type Plan, getPlan } from '../plans.js';
 import { emitWebhook } from '../lib/webhooks.js';
-import { AgentError, clientForHost, hostFits } from './agentClient.js';
+import { AgentError, clientForHost } from './agentClient.js';
 import { rankHosts } from './placement.js';
 
 export interface HostRow {
