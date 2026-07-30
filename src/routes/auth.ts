@@ -125,6 +125,15 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
           "INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')",
           [teamId, userId],
         );
+        // Record that this person has now had their trial. The trial belongs to
+        // the user, not the team (migration 036) — without this the account
+        // would arrive with a trial *and* still be owed one, so their next team
+        // would hand out a second.
+        //
+        // Only on the self-serve path: someone joining via an invitation gets
+        // no team of their own here, so they have consumed nothing and should
+        // still get a trial if they later start something themselves.
+        await tx.query('UPDATE users SET trial_started_at = now() WHERE id = $1', [userId]);
       }
       return { id: userId, teamId };
     });

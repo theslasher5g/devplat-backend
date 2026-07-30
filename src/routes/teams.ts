@@ -13,6 +13,21 @@ import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
 import { SESSION_COOKIE, requireApiTokenOrUser, requireMember, requireTeamAdmin, requireUser, sessionCookieOptions } from '../plugins/auth.js';
 
 /**
+ * How many teams one person may own.
+ *
+ * With the trial bound to the user (see migration 036) there is no longer a
+ * prize for creating teams in bulk, so this is hygiene rather than the defence:
+ * it bounds audit noise, stray rows and invite spam from a compromised account.
+ * Generous enough that an agency running separate teams per client never
+ * notices; low enough that a script can't leave thousands behind.
+ */
+const MAX_OWNED_TEAMS = 5;
+
+/** Thrown inside the create-team transaction so the cap check rolls back
+ *  everything with it, rather than leaving a half-made team behind. */
+class TeamLimitReached extends Error {}
+
+/**
  * Seat cap check for a team's tier. Counts current members plus outstanding
  * invites, so a team can't quietly exceed its plan by sending a batch of
  * invites that all get accepted later. Returns an error body to send, or null
@@ -73,7 +88,20 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     // Mirror requireMember's fallback so the UI highlights the same team the
     // API is actually operating on when nothing has been chosen yet.
     if (teams.length > 0 && !teams.some((t) => t.active)) teams[0].active = true;
-    return { teams };
+
+    // Told to the UI so the create-team dialog can say up front what the new
+    // team will be, rather than letting someone make one and discover it can't
+    // start an environment. The trial is once per person; a second team begins
+    // on a paid plan or not at all.
+    const me = await one<{ trial_used: boolean }>(
+      'SELECT (trial_started_at IS NOT NULL) AS trial_used FROM users WHERE id = $1', [req.user.id],
+    );
+    return {
+      teams,
+      trialAvailable: !me.trial_used,
+      ownedTeams: teams.filter((t) => t.role === 'owner').length,
+      maxOwnedTeams: MAX_OWNED_TEAMS,
+    };
   });
 
   // Switch which team subsequent requests act in.
@@ -100,22 +128,64 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
   }, async (req, reply) => {
     const { name } = req.body as { name: string };
     const trialDays = getPlan('free').trialDurationDays;
-    const teamId = await withTransaction(async (tx) => {
-      const t = await tx.query<{ id: string }>(
-        trialDays
-          ? "INSERT INTO teams (name, trial_ends_at) VALUES ($1, now() + ($2 || ' days')::interval) RETURNING id"
-          : 'INSERT INTO teams (name) VALUES ($1) RETURNING id',
-        trialDays ? [name.trim(), String(trialDays)] : [name.trim()],
-      );
-      const id = t.rows[0].id;
-      await tx.query("INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')", [id, req.user.id]);
-      // Land the user in the team they just made, rather than leaving them in
-      // whichever one the fallback would have picked.
-      await tx.query('UPDATE users SET active_team_id = $1 WHERE id = $2', [id, req.user.id]);
-      return id;
-    });
-    await auditFromReq(req, 'team.create', { teamId, target: name.trim() });
-    return reply.code(201).send({ ok: true, teamId });
+
+    let trialGranted = false;
+    let teamId: string;
+    try {
+      teamId = await withTransaction(async (tx) => {
+        // Claim the trial and take the user's row lock in one statement.
+        //
+        // COALESCE means the value only moves the first time; comparing the
+        // result to now() then says whether THIS call was the one that consumed
+        // it, because now() is the transaction timestamp and any earlier claim
+        // carries a different one. The UPDATE also locks the row, so two
+        // simultaneous create requests from the same account serialise here
+        // instead of both seeing NULL and both granting a trial.
+        const claim = await tx.query<{ granted: boolean }>(
+          `UPDATE users SET trial_started_at = COALESCE(trial_started_at, now())
+           WHERE id = $1 RETURNING (trial_started_at = now()) AS granted`,
+          [req.user.id],
+        );
+        trialGranted = claim.rows[0]?.granted === true;
+
+        // Counted after the lock above, so a burst of concurrent creates can't
+        // each read the same under-limit count and all proceed.
+        const owned = await tx.query<{ count: string }>(
+          "SELECT count(*) FROM team_members WHERE user_id = $1 AND role = 'owner'",
+          [req.user.id],
+        );
+        if (Number(owned.rows[0].count) >= MAX_OWNED_TEAMS) throw new TeamLimitReached();
+
+        // A team created by someone who has already used their trial starts
+        // already expired rather than with no trial column set: effectivePlan()
+        // treats a lapsed free team as zero parallel environments, which is
+        // exactly the intended state. Reusing the existing expiry path means no
+        // second notion of "not entitled" to keep in sync.
+        const t = await tx.query<{ id: string }>(
+          `INSERT INTO teams (name, trial_ends_at)
+           VALUES ($1, CASE WHEN $2::int IS NULL THEN now() ELSE now() + ($2 || ' days')::interval END)
+           RETURNING id`,
+          [name.trim(), trialGranted && trialDays ? String(trialDays) : null],
+        );
+        const id = t.rows[0].id;
+        await tx.query("INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, 'owner')", [id, req.user.id]);
+        // Land the user in the team they just made, rather than leaving them in
+        // whichever one the fallback would have picked.
+        await tx.query('UPDATE users SET active_team_id = $1 WHERE id = $2', [id, req.user.id]);
+        return id;
+      });
+    } catch (err) {
+      if (err instanceof TeamLimitReached) {
+        return reply.code(409).send({
+          error: 'team_limit_reached',
+          detail: `You can own up to ${MAX_OWNED_TEAMS} teams. Leave or delete one first, or write to us if you genuinely need more.`,
+        });
+      }
+      throw err;
+    }
+
+    await auditFromReq(req, 'team.create', { teamId, target: name.trim(), detail: { trialGranted } });
+    return reply.code(201).send({ ok: true, teamId, trialGranted });
   });
 
   app.get('/teams/me', { preHandler: requireMember }, async (req) => {

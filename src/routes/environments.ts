@@ -54,6 +54,24 @@ export default async function environmentRoutes(app: FastifyInstance): Promise<v
     if (!teamRateLimiter.allow(teamId)) {
       return reply.code(429).send({ error: 'rate_limited', detail: 'Too many environment requests — slow down and retry shortly.' });
     }
+    // A team with no entitlement at all — a lapsed free trial, or a team
+    // created by someone who had already used their one trial — has a
+    // parallelism cap of zero. Without this check the request is queued and
+    // then waits forever: the queue worker retries it every few seconds and the
+    // cap it's waiting on can never be met. The CLI showed "queued, waiting for
+    // capacity…" indefinitely, which points the customer at the wrong problem
+    // entirely — it reads as our capacity shortage rather than their billing.
+    //
+    // 402 rather than 502: nothing is broken, a plan is needed.
+    const plan = await effectivePlan(teamId);
+    if (plan.parallelEnvs === 0) {
+      return reply.code(402).send({
+        error: 'plan_required',
+        detail: 'This team has no active plan, so it cannot start environments. '
+          + 'Choose a plan in the dashboard under Billing.',
+      });
+    }
+
     const result = await requestEnvironment(teamId, req.apiTokenId ?? null);
     return reply.code(result.status === 'failed' ? 502 : 202).send(result);
   });

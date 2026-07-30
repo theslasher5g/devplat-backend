@@ -161,6 +161,40 @@ Nothing acts on any of this yet. It exists so an overcommit factor can be sized
 from evidence rather than estimated, and so placement can later be ordered by
 real load.
 
+### The free trial is per user, not per team
+
+`POST /teams` used to give every new team a fresh 14-day trial with no cap on
+how many a person could create. That is not merely "a trial can be extended":
+the free tier grants one parallel environment per team, so ten teams is ten
+concurrent environments — more parallelism than the Solo plan costs CHF 19 a
+month to get. The 10/hour rate limit bounded the speed of the abuse, not the
+abuse.
+
+`users.trial_started_at` (migration 036) makes the trial a property of the
+person. Registration claims it; a later `POST /teams` grants a trial only if it
+is still unclaimed, and otherwise creates the team with `trial_ends_at = now()`
+— already expired, which `effectivePlan()` already treats as zero parallel
+environments. Reusing the expiry path avoids a second notion of "not entitled"
+to keep in sync.
+
+The claim and the row lock are one statement:
+`UPDATE users SET trial_started_at = COALESCE(trial_started_at, now()) …
+RETURNING (trial_started_at = now())`. `now()` is the transaction timestamp, so
+equality is true exactly when *this* call consumed it, and the lock serialises
+concurrent creates from the same account.
+
+Capping team count alone would only have raised the price of the trick; binding
+the trial removes the reason to try. The cap (5 owned teams) stays as hygiene
+against audit noise and invite spam from a compromised account.
+
+Being invited into someone else's team consumes nothing — that person still has
+their own trial if they later start a team themselves.
+
+Note the honest limit: this stops one account minting trials. It does not stop
+someone registering several accounts with different addresses. Email
+verification raises the cost; properly closing it would need payment-method or
+device signals, which we do not collect today.
+
 ### Capacity pressure
 
 `reserveSlot()` stamps `environment_requests.capacity_blocked_at` the first
