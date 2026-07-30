@@ -1,0 +1,22 @@
+-- Record who minted an API token, so revoking one can be authorised.
+--
+-- Until now every endpoint in tokens.ts used requireMember, which meant any
+-- member of the team — including a developer invited an hour ago — could revoke
+-- any token in the team, including the one the production CI pipeline runs on.
+-- That is a one-click outage with no undo (the plaintext is never stored, so a
+-- revoked token cannot be put back, only replaced).
+--
+-- With a creator recorded, the rule becomes: revoke your own freely, admins and
+-- owners revoke anything. Reading the list stays open to every member — knowing
+-- which credentials exist is not privileged, and the prefix is not the secret.
+--
+-- Nullable and ON DELETE SET NULL on purpose:
+--   * every token that already exists has no recorded creator, and inventing one
+--     would be a lie about who is responsible for a live credential;
+--   * when the person who made a token leaves, the token must keep working —
+--     killing CI because someone changed jobs is exactly the failure this whole
+--     column is meant to prevent.
+-- A NULL creator therefore means "nobody personally owns this", which the API
+-- treats as admin-only to revoke: the conservative side of the fence, and the
+-- side that protects the pre-existing production tokens this migration inherits.
+ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;

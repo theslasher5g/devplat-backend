@@ -15,10 +15,14 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
         id: string; label: string; token_prefix: string; scope: string;
         created_at: string; last_used_at: string | null; last_cli_version: string | null;
         expires_at: string | null; ip_allowlist: string[] | null;
+        created_by: string | null; created_by_email: string | null;
       }>(
-        `SELECT id, label, token_prefix, scope, created_at, last_used_at, last_cli_version, expires_at,
-                ip_allowlist::text[] AS ip_allowlist
-         FROM api_tokens WHERE team_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC`,
+        `SELECT t.id, t.label, t.token_prefix, t.scope, t.created_at, t.last_used_at, t.last_cli_version,
+                t.expires_at, t.ip_allowlist::text[] AS ip_allowlist,
+                t.created_by, u.email AS created_by_email
+         FROM api_tokens t
+         LEFT JOIN users u ON u.id = t.created_by
+         WHERE t.team_id = $1 AND t.revoked_at IS NULL ORDER BY t.created_at DESC`,
         [teamId],
       ),
       // Per-token run counts per day over the window, for the usage sparkline.
@@ -44,6 +48,10 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
       byToken.set(r.token_id, m);
     }
 
+    // The revoke rule is decided here and shipped with each row rather than
+    // re-derived in the UI: the button and the endpoint then cannot disagree,
+    // and a future change to the rule can't leave a live button that 403s.
+    const isTeamAdmin = req.membership.role !== 'developer';
     return {
       tokens: res.rows.map((t) => {
         const m = byToken.get(t.id);
@@ -53,6 +61,9 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
           label: t.label,
           prefix: t.token_prefix,
           scope: t.scope,
+          createdBy: t.created_by_email,
+          createdByMe: t.created_by === req.user.id,
+          canRevoke: isTeamAdmin || t.created_by === req.user.id,
           createdAt: t.created_at,
           lastUsedAt: t.last_used_at,
           lastCliVersion: t.last_cli_version,
@@ -103,12 +114,13 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
     }
     const { token, hash, prefix } = generateApiToken(scope);
     const row = await query<{ id: string; created_at: string; expires_at: string | null }>(
-      `INSERT INTO api_tokens (team_id, label, token_prefix, scope, token_hash, expires_at, ip_allowlist)
+      `INSERT INTO api_tokens (team_id, label, token_prefix, scope, token_hash, expires_at, ip_allowlist, created_by)
        VALUES ($1, $2, $3, $4, $5,
                CASE WHEN $6::int IS NULL THEN NULL ELSE now() + ($6 || ' days')::interval END,
-               CASE WHEN cardinality($7::text[]) = 0 THEN NULL ELSE $7::cidr[] END)
+               CASE WHEN cardinality($7::text[]) = 0 THEN NULL ELSE $7::cidr[] END,
+               $8)
        RETURNING id, created_at, expires_at`,
-      [req.membership.teamId, label.trim(), prefix, scope, hash, expiresInDays ?? null, rawCidrs.map(normalizeCidr)],
+      [req.membership.teamId, label.trim(), prefix, scope, hash, expiresInDays ?? null, rawCidrs.map(normalizeCidr), req.user.id],
     );
     await auditFromReq(req, 'token.create', { target: label.trim(), detail: { scope, prefix, expiresInDays: expiresInDays ?? null } });
     // Minting a credential is exactly the action an account-takeover would
@@ -126,12 +138,29 @@ export default async function tokenRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  // Revoking is irreversible — the plaintext was never stored, so a token taken
+  // out cannot be put back, only replaced, and anything running on it breaks at
+  // once. A developer may therefore only revoke tokens they minted themselves;
+  // owners and admins may revoke any of the team's, including the inherited ones
+  // with no recorded creator.
   app.delete('/tokens/:id', { preHandler: requireMember }, async (req, reply) => {
     const { id } = req.params as { id: string };
+    const target = await maybeOne<{ created_by: string | null }>(
+      'SELECT created_by FROM api_tokens WHERE id = $1 AND team_id = $2 AND revoked_at IS NULL',
+      [id, req.membership.teamId],
+    );
+    if (!target) return reply.code(404).send({ error: 'not_found' });
+    if (req.membership.role === 'developer' && target.created_by !== req.user.id) {
+      return reply.code(403).send({
+        error: 'token_not_yours',
+        detail: 'You can only revoke tokens you created yourself. Ask a team owner or admin to revoke this one.',
+      });
+    }
     const found = await maybeOne<{ id: string; label: string }>(
       'UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND team_id = $2 AND revoked_at IS NULL RETURNING id, label',
       [id, req.membership.teamId],
     );
+    // Lost a race with a concurrent revoke — the token is gone either way.
     if (!found) return reply.code(404).send({ error: 'not_found' });
     await auditFromReq(req, 'token.revoke', { target: found.label });
     return { ok: true };
