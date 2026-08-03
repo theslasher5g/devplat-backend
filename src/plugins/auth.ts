@@ -139,7 +139,15 @@ export async function requireUser(req: FastifyRequest, reply: FastifyReply): Pro
   let issuedAtMs = 0;
   let sessionId: string | null = null;
   try {
-    const payload = jwt.verify(raw, config.jwtSecret) as { sub?: string; iat?: number; sid?: string };
+    // algorithms pinned rather than left to the library's defaults. With a
+    // symmetric secret jsonwebtoken 9 already refuses `alg: none` and will not
+    // treat the secret as a public key, so this is not closing an open hole —
+    // it is making the assumption explicit, so that swapping jwtSecret for a
+    // key pair some day cannot silently re-open the algorithm-confusion class
+    // of bug at a call site nobody thought to revisit.
+    const payload = jwt.verify(raw, config.jwtSecret, {
+      algorithms: ['HS256'],
+    }) as { sub?: string; iat?: number; sid?: string };
     if (!payload.sub) throw new Error('no sub');
     userId = payload.sub;
     // jsonwebtoken always stamps iat; treat a token without one as unusable

@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { sendHostOfflineEmail, sendOpsEmail } from './email.js';
+import { sanitizeAlertSubject } from './sanitize.js';
 
 /** Fan an ops alert out to every configured channel. Each channel is
  *  independent and best-effort: one failing (Resend down, Slack webhook 500)
@@ -39,14 +40,18 @@ export async function sendHostOfflineAlert(host: {
 
 /**
  * Generic ops alert: email plus Slack, same best-effort fan-out as above.
- * `emoji` only affects the Slack line; the mail carries the subject and body
- * as written.
+ * `emoji` only affects the Slack line; the body is carried as written.
+ *
+ * The subject is sanitised here rather than at each call site. Callers pass
+ * strings built from host names, routes and error text, and remembering to
+ * clean each one is the kind of rule that holds until the next alert is added.
  */
 export async function sendOpsAlert(
-  subject: string,
+  rawSubject: string,
   body: string,
   emoji = ':warning:',
 ): Promise<void> {
+  const subject = sanitizeAlertSubject(rawSubject);
   const results = await Promise.allSettled([
     sendOpsEmail(`[devplat ops] ${subject}`, body),
     postSlack(`${emoji} *${subject}*\n${body}`),

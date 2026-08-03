@@ -1,5 +1,6 @@
 import { query } from '../db.js';
 import { sendOpsAlert } from './alerts.js';
+import { sanitizeRoute } from './sanitize.js';
 import { fingerprint as fingerprintFor, redact } from './errorFingerprint.js';
 
 /**
@@ -72,7 +73,8 @@ export async function captureError(e: CapturedError): Promise<void> {
   try {
     const message = redact(e.message).slice(0, 2000);
     const stack = e.stack ? redact(e.stack).slice(0, 4000) : null;
-    const fingerprint = fingerprintFor({ source: e.source, message, stack: e.stack, route: e.route });
+    const route = e.route ? sanitizeRoute(e.route) : undefined;
+    const fingerprint = fingerprintFor({ source: e.source, message, stack: e.stack, route });
 
     // One statement does insert-or-bump and tells us whether this is new and
     // whether it's due an alert, so there's no read-then-write race between
@@ -122,7 +124,7 @@ export async function captureError(e: CapturedError): Promise<void> {
                  -- actual question — and it stays race-free, because it's still
                  -- one statement doing the read, the write and the decision.
                  (alerted_at = now()) AS should_alert`,
-      [fingerprint, e.source, message, stack, e.route ?? null, e.method ?? null,
+      [fingerprint, e.source, message, stack, route ?? null, e.method ?? null,
         e.statusCode ?? null, String(REALERT_AFTER_MS), CLIENT_ALERT_MIN_COUNT],
     );
 
@@ -144,7 +146,7 @@ export async function captureError(e: CapturedError): Promise<void> {
       return;
     }
 
-    const where = e.route ? `${e.method ?? ''} ${e.route}`.trim() : e.source;
+    const where = route ? `${e.method ?? ''} ${route}`.trim() : e.source;
     // A client error that crosses the threshold is neither "new" (it has been
     // happening for a while) nor merely "recurring" — the notable thing is that
     // it spread, so the subject says which.

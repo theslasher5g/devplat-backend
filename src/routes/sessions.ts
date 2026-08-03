@@ -22,7 +22,9 @@ function currentSessionId(req: { cookies?: Record<string, unknown>; headers: Rec
       : undefined);
   if (!raw) return null;
   try {
-    const payload = jwt.verify(raw, config.jwtSecret) as { sid?: string };
+    // Same pin as plugins/auth.ts: the two verify sites must not be able to
+    // drift apart on which algorithms they accept.
+    const payload = jwt.verify(raw, config.jwtSecret, { algorithms: ['HS256'] }) as { sid?: string };
     return typeof payload.sid === 'string' ? payload.sid : null;
   } catch {
     return null;
