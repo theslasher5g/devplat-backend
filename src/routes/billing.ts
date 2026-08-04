@@ -27,6 +27,11 @@ export default async function billingRoutes(app: FastifyInstance): Promise<void>
       [req.membership.teamId],
     );
     const plan = getPlan(team.plan_tier);
+    // Seats are now part of what the team pays, so they belong in the summary
+    // the billing page renders. Counted here rather than derived on the client:
+    // the invoice is built from this number, and a page that computes its own
+    // is a page that can disagree with the charge.
+    const seats = await currentSeats(req.membership.teamId);
     return {
       planTier: team.plan_tier,
       planLabel: plan.label,
@@ -34,7 +39,18 @@ export default async function billingRoutes(app: FastifyInstance): Promise<void>
       vcpuPerEnvironment: plan.vcpuPerEnv,
       ramGbPerEnvironment: plan.ramMbPerEnv / 1024,
       maxFootprintGb: maxFootprintGb(plan),
+      /** Base price. Kept as-is rather than renamed: existing clients read it. */
       chfMonthly: plan.chfMonthly,
+      chfPerSeatMonthly: plan.chfPerSeatMonthly,
+      includedSeats: plan.includedSeats,
+      /** People in the team right now — the number seats are charged from. */
+      seats,
+      billableSeats: billableSeats(plan, seats),
+      /** Base + seats. Null on a tier whose price is agreed rather than
+       *  computed, so the page shows "on request" instead of inventing one. */
+      chfTotalMonthly: monthlyCost(plan, seats),
+      maxSeats: plan.maxMembers,
+      selfServe: plan.selfServe,
       trialEndsAt: team.plan_tier === 'free' ? team.trial_ends_at : null,
       subscription: sub
         ? { status: sub.status, currentPeriodEnd: sub.current_period_end, priceId: sub.stripe_price_id }

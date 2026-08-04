@@ -3,6 +3,7 @@ import type { PlanTier } from './config.js';
 // The arithmetic lives in lib/pricing.ts, which has no database import — see
 // the note there. Re-exported so callers keep a single place to reach for.
 export { billableSeats, monthlyCost } from './lib/pricing.js';
+import { nextAvailable } from './lib/pricing.js';
 
 /**
  * Plan/tier data. The `plans` table (migrations/003_plans.sql) is the single
@@ -107,12 +108,18 @@ export function allPlans(): Plan[] {
 }
 
 /** The next tier up, or null at the top. Used to turn "you keep hitting your
- *  limit" into a concrete suggestion rather than a complaint. Free's next step
- *  is Solo — the trial ladder and the paid ladder are the same list. */
+ *  limit" into a concrete suggestion rather than a complaint.
+ *
+ *  Retired tiers are skipped, which is why this is a scan and not `i + 1`.
+ *  Since Solo was retired (migration 043) the naive step would answer "Solo"
+ *  for every evaluation team that hit its limit — a plan whose checkout refuses
+ *  with 410. A suggestion nobody can act on is worse than none.
+ *
+ *  Sales-led tiers are NOT skipped: "talk to us" is a real next step, and it is
+ *  the top of the range, so skipping it would leave large teams with nothing. */
 export function nextTierUp(tier: PlanTier): Plan | null {
-  const i = TIER_ORDER.indexOf(tier);
-  if (i < 0 || i === TIER_ORDER.length - 1) return null;
-  return getPlan(TIER_ORDER[i + 1]);
+  const next = nextAvailable(TIER_ORDER, tier, (t) => getPlan(t).available);
+  return next ? getPlan(next) : null;
 }
 
 /** Max total RAM a tier can occupy at once, in GB (derived, never stored). */

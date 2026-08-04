@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { billableSeats, monthlyCost, seatDrift, type Priced, type SeatState } from '../src/lib/pricing.js';
+import { billableSeats, monthlyCost, nextAvailable, seatDrift, type Priced, type SeatState } from '../src/lib/pricing.js';
 
 /**
  * Seat pricing is the change that removes the revenue ceiling, which makes it
@@ -104,4 +104,44 @@ test('a synced-at-zero subscription is distinguishable from an unsynced one', ()
   assert.equal(seatDrift(state({ billable: 0, billedQuantity: 0 })), 0);
   assert.equal(seatDrift(state({ billable: 0, billedQuantity: null })), 0,
     'zero billable and never synced still needs no change');
+});
+
+/* ---- the upgrade ladder ---- */
+
+// The real tier order, and the real gap in it: Solo was retired by migration
+// 043 but stays in the list because teams.plan_tier references it.
+const ORDER = ['free', 'solo', 'team', 'scale'] as const;
+const RETIRED = new Set<string>(['solo']);
+const live = (t: string) => !RETIRED.has(t);
+
+test('a retired tier is stepped over, not suggested', () => {
+  // The bug this exists for: `i + 1` answers "Solo" here, and Solo's checkout
+  // refuses with 410. Every evaluation team that hit its limit would have been
+  // pointed at a plan it cannot buy.
+  assert.equal(nextAvailable(ORDER, 'free', live), 'team');
+});
+
+test('the ordinary step is still the next one up', () => {
+  assert.equal(nextAvailable(ORDER, 'team', live), 'scale');
+});
+
+test('the top of the ladder has nothing above it', () => {
+  assert.equal(nextAvailable(ORDER, 'scale', live), null);
+});
+
+test('a sales-led tier is a valid destination', () => {
+  // Only `available` gates the ladder. Suggesting "talk to us" is a real next
+  // step, and it is the top of the range — skipping it would leave the largest
+  // teams with no upgrade path at all.
+  assert.equal(nextAvailable(ORDER, 'team', () => true), 'scale');
+});
+
+test('a tier that is not on the ladder has no next step', () => {
+  assert.equal(nextAvailable(ORDER, 'nonexistent' as never, live), null);
+});
+
+test('every remaining tier retired above the current one yields null', () => {
+  // Not a theoretical case: retiring Team without replacing it would otherwise
+  // hand back a plan that cannot be bought.
+  assert.equal(nextAvailable(ORDER, 'free', (t) => t === 'free'), null);
 });

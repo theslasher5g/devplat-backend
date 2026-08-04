@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { config, type PlanTier } from '../config.js';
-import { getPlan } from '../plans.js';
+import { billableSeats, getPlan } from '../plans.js';
 import { maybeOne, query, withTransaction } from '../db.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { HOST_USAGE_COLUMNS, type HostUsageColumns, presentHostOvercommit, presentHostUsage } from '../lib/hostUsage.js';
@@ -188,7 +188,16 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
         planLabel: getPlan(t.plan_tier).label,
         planOverride: t.plan_override,
         planOverrideLabel: t.plan_override ? getPlan(t.plan_override).label : null,
-        mrrChf: getPlan(t.plan_tier).chfMonthly,
+        // Base + seats, from the members already counted for this row. The base
+        // alone was right until seat pricing landed; after it, the teams that
+        // grew were the ones this understated most.
+        mrrChf: getPlan(t.plan_tier).chfMonthly
+          + billableSeats(getPlan(t.plan_tier), Number(t.member_count)) * getPlan(t.plan_tier).chfPerSeatMonthly,
+        // False on a tier whose price is agreed in a conversation: the figure
+        // above is then the list price of a plan that is not sold at list, and
+        // presenting it as revenue without saying so is how a dashboard lies
+        // politely. The UI marks these rather than hiding them.
+        mrrKnown: getPlan(t.plan_tier).selfServe,
         subscriptionStatus: t.status,
         currentPeriodEnd: t.current_period_end,
         ownerEmail: t.owner_email,
@@ -446,8 +455,24 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
       query<{ count: string }>("SELECT count(*) FROM environment_requests WHERE status = 'assigned'"),
       query<{ count: string }>("SELECT count(*) FROM environment_requests WHERE status IN ('queued', 'assigning')"),
     ]);
-    const mrr = await query<{ plan_tier: PlanTier; count: string }>(
-      "SELECT plan_tier, count(*) FROM teams WHERE plan_tier != 'free' GROUP BY plan_tier",
+    // Seats are part of the bill now, so they have to be part of MRR. Counting
+    // base prices alone understated every account that grew — which is exactly
+    // the growth the seat model was introduced to capture, so the one number
+    // that would have shown it working was the one blind to it.
+    //
+    // Billable seats are summed in SQL rather than per-team in JS: this is one
+    // row per tier either way, and pulling every team back to count members
+    // would be a query per team on the busiest admin page.
+    const mrr = await query<{ plan_tier: PlanTier; count: string; billable_seats: string }>(
+      `SELECT t.plan_tier,
+              count(*) AS count,
+              COALESCE(sum(GREATEST(0,
+                (SELECT count(*) FROM team_members m WHERE m.team_id = t.id) - p.included_seats
+              )), 0) AS billable_seats
+       FROM teams t
+       JOIN plans p ON p.id = t.plan_tier
+       WHERE t.plan_tier != 'free'
+       GROUP BY t.plan_tier`,
     );
     // A host counts as "connected" the same way the scheduler would treat it
     // as usable: a heartbeat within the configured timeout. Previously this
@@ -473,12 +498,28 @@ export default async function adminRoutes(app: FastifyInstance): Promise<void> {
     const cacheLookups = Number(cache.rows[0].lookups ?? 0);
     const cacheHits = Number(cache.rows[0].hits ?? 0);
     const cacheReportingHosts = Number(cache.rows[0].reporting);
-    // MRR split by tier, so the number isn't just one opaque total.
+    // MRR split by tier, so the number isn't just one opaque total. Base and
+    // seat revenue are reported separately: they are two different growth
+    // stories, and a combined figure hides which one is moving.
     const mrrByTier = mrr.rows
       .map((r) => {
         const plan = getPlan(r.plan_tier);
         const count = Number(r.count);
-        return { tier: r.plan_tier, label: plan.label, count, chfEach: plan.chfMonthly, chfTotal: plan.chfMonthly * count };
+        const billableSeats = Number(r.billable_seats);
+        const chfBase = plan.chfMonthly * count;
+        const chfSeats = plan.chfPerSeatMonthly * billableSeats;
+        return {
+          tier: r.plan_tier, label: plan.label, count,
+          chfEach: plan.chfMonthly,
+          billableSeats,
+          chfBase,
+          chfSeats,
+          chfTotal: chfBase + chfSeats,
+          /** See the note on mrrKnown above: a sales-led tier's contribution is
+           *  a list price nobody is billed at. Kept in the total — dropping it
+           *  would zero out the largest customers — but marked. */
+          priceKnown: plan.selfServe,
+        };
       })
       .sort((a, b) => b.chfTotal - a.chfTotal);
     return {

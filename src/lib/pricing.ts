@@ -44,6 +44,29 @@ export function monthlyCost(plan: Priced, seats: number): number | null {
   return plan.chfMonthly + billableSeats(plan, seats) * plan.chfPerSeatMonthly;
 }
 
+/**
+ * The next rung up a ladder that has gaps in it.
+ *
+ * Split out from plans.ts because the interesting case — skipping a retired
+ * tier — could not be tested there: nextTierUp() reaches getPlan(), which needs
+ * the cache filled from Postgres, so the one function whose bug is silent had
+ * no reachable test. Same reason lib/pricing.ts exists at all.
+ *
+ * `available` decides what counts as a rung. A tier that can no longer be
+ * bought is stepped over, not returned: after Solo was retired, the naive
+ * `i + 1` answered "Solo" for every evaluation team that hit its limit, and
+ * that plan's checkout refuses with 410. A suggestion nobody can act on is
+ * worse than no suggestion.
+ */
+export function nextAvailable<T>(order: readonly T[], current: T, available: (tier: T) => boolean): T | null {
+  const i = order.indexOf(current);
+  if (i < 0) return null;
+  for (const candidate of order.slice(i + 1)) {
+    if (available(candidate)) return candidate;
+  }
+  return null;
+}
+
 export interface SeatState {
   teamId: string;
   tier: PlanTier;
