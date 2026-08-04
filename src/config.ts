@@ -56,6 +56,22 @@ export const config = {
     team: { monthly: process.env.STRIPE_PRICE_TEAM_MONTHLY ?? '', yearly: process.env.STRIPE_PRICE_TEAM_YEARLY ?? '' },
     scale: { monthly: process.env.STRIPE_PRICE_SCALE_MONTHLY ?? '', yearly: process.env.STRIPE_PRICE_SCALE_YEARLY ?? '' },
   } as Record<Exclude<PlanTier, 'free'>, { monthly: string; yearly: string }>,
+  // Per-seat prices, charged on top of the base above. Only tiers that bill per
+  // seat need one; an empty value means "this tier has no seat price
+  // configured", which checkout treats as a refusal rather than as free seats.
+  //
+  // Create these in Stripe as recurring prices with usage_type=licensed (the
+  // quantity is a seat count we set, not metered usage). The base price and the
+  // seat price must share a billing interval, or Stripe rejects the
+  // subscription.
+  stripeSeatPrices: {
+    solo: { monthly: '', yearly: '' },
+    team: {
+      monthly: process.env.STRIPE_SEAT_TEAM_MONTHLY ?? '',
+      yearly: process.env.STRIPE_SEAT_TEAM_YEARLY ?? '',
+    },
+    scale: { monthly: '', yearly: '' },
+  } as Record<Exclude<PlanTier, 'free'>, { monthly: string; yearly: string }>,
   // Optional seasonal discount campaign (e.g. "15% off in August"). Point
   // PROMO_COUPON_ID at a Stripe coupon you created once; while now < PROMO_ENDS_AT
   // it's applied automatically at checkout (no code to type) and advertised via

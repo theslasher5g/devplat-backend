@@ -38,6 +38,7 @@ export const SchedulerLock = {
   maintenance: 4,
   capacityNotices: 5,
   webhookDelivery: 6,
+  seatSync: 7,
 } as const;
 
 export type SchedulerLockId = (typeof SchedulerLock)[keyof typeof SchedulerLock];

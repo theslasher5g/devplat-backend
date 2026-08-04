@@ -7,6 +7,7 @@ import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { AUDIT_CSV_HEADER, auditCsvRow, auditFilters } from '../lib/auditExport.js';
 import { sendTeamInviteEmail, sendTwoFactorRequiredEmail } from '../lib/email.js';
 import { getOrCreateReferralCode } from '../lib/referral.js';
+import { pushSeats } from '../scheduler/seatSync.js';
 import { stripe } from '../lib/stripe.js';
 import { notifyOwnershipTransferred } from '../lib/securityEvents.js';
 import { generateOneTimeToken, hashToken } from '../lib/tokens.js';
@@ -755,6 +756,11 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
       // Joining a team is an explicit act — make it the one they land in.
       await tx.query('UPDATE users SET active_team_id = $1 WHERE id = $2', [invite.team_id, req.user.id]);
     });
+    // After the transaction, never inside it: pushSeats talks to Stripe over the
+    // network, and holding a database transaction open across that would put a
+    // third party's latency inside our own lock. It is best-effort by design —
+    // the reconciler in scheduler/seatSync.ts fixes what fails here.
+    void pushSeats(invite.team_id);
     return { ok: true, teamId: invite.team_id };
   });
 
@@ -791,6 +797,7 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     }
     const teamId = req.membership.teamId;
     await query('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, req.user.id]);
+    void pushSeats(teamId);
     // Audited against the team so the remaining admins can see who left.
     await auditFromReq(req, 'member.leave', { teamId, target: req.user.email });
     return { ok: true };
@@ -841,6 +848,10 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     if (!target) return reply.code(404).send({ error: 'not_a_member' });
     if (target.role === 'owner') return reply.code(403).send({ error: 'cannot_remove_owner' });
     await query('DELETE FROM team_members WHERE team_id = $1 AND user_id = $2', [req.membership.teamId, userId]);
+    // Fire-and-forget on purpose. Revoking a leaver's access must not be held
+    // up, or refused, because a billing API is slow — one wrong seat for an
+    // hour is cheaper than access that outlives the decision to remove it.
+    void pushSeats(req.membership.teamId);
     // Removing someone's access is exactly the kind of action an audit trail
     // exists for; it was the only member mutation not being recorded.
     const removed = await maybeOne<{ email: string }>('SELECT email FROM users WHERE id = $1', [userId]);

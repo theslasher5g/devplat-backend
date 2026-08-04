@@ -14,6 +14,7 @@ import authRoutes from './routes/auth.js';
 import deviceAuthRoutes from './routes/deviceAuth.js';
 import billingRoutes from './routes/billing.js';
 import contactRoutes from './routes/contact.js';
+import enquiryRoutes from './routes/enquiries.js';
 import dataExportRoutes from './routes/dataExport.js';
 import environmentRoutes from './routes/environments.js';
 import outgoingWebhookRoutes from './routes/outgoingWebhooks.js';
@@ -32,6 +33,7 @@ import { startQueueWorker } from './scheduler/queueWorker.js';
 import { startCapacityNoticeWorker } from './scheduler/capacityNotices.js';
 import { startWebhookWorker } from './scheduler/webhookDelivery.js';
 import { startMaintenanceWorker } from './scheduler/maintenance.js';
+import { startSeatSync } from './scheduler/seatSync.js';
 import { startTrialNoticeWorker } from './scheduler/trialNotices.js';
 
 /** The set of browser origins allowed to call the API with credentials: the
@@ -182,6 +184,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await app.register(sessionRoutes);
   await app.register(deviceAuthRoutes);
   await app.register(contactRoutes);
+  await app.register(enquiryRoutes);
   await app.register(dataExportRoutes);
   await app.register(teamRoutes);
   await app.register(tokenRoutes);
@@ -214,6 +217,10 @@ export async function buildServer(): Promise<FastifyInstance> {
   const stopCapacityNotices = startCapacityNoticeWorker();
   // Delivers queued outgoing webhooks to customer endpoints, with retries.
   const stopWebhooks = startWebhookWorker(config.schedulerPollIntervalMs);
+  // Fixes seat quantities the fast path failed to push. Membership changes tell
+  // Stripe immediately and best-effort; this is what stops a failed push from
+  // becoming a quarter of undercharged invoices on the accounts that grew.
+  const stopSeatSync = startSeatSync();
   if (config.webhookAllowPrivateTargets) {
     app.log.warn(
       'WEBHOOK_ALLOW_PRIVATE_TARGETS is on — outgoing webhooks may reach private/loopback addresses. '
@@ -227,6 +234,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     stopMaintenance();
     stopCapacityNotices();
     stopWebhooks();
+    stopSeatSync();
   });
 
   return app;

@@ -1,7 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { activePromo, config, type PlanTier } from '../config.js';
 import { maybeOne, one } from '../db.js';
-import { getPlan, maxFootprintGb } from '../plans.js';
+import { billableSeats, getPlan, maxFootprintGb, monthlyCost } from '../plans.js';
+import { currentSeats } from '../lib/seats.js';
 import { ensureStripeCustomer, requireStripe } from '../lib/stripe.js';
 import { requireTeamAdmin } from '../plugins/auth.js';
 
@@ -56,8 +57,53 @@ export default async function billingRoutes(app: FastifyInstance): Promise<void>
     },
   }, async (req, reply) => {
     const { tier, interval } = req.body as { tier: 'solo' | 'team' | 'scale'; interval: 'monthly' | 'yearly' };
+
+    // A tier that is no longer offered, or one that is sold by conversation
+    // rather than by button, must not be reachable through checkout — including
+    // by someone posting the tier name directly. The pricing page hides them;
+    // this is what makes hiding them mean something.
+    const plan = getPlan(tier);
+    if (!plan.available) {
+      return reply.code(410).send({
+        error: 'plan_retired',
+        detail: `${plan.label} is no longer offered. See the pricing page for the current plans.`,
+      });
+    }
+    if (!plan.selfServe) {
+      return reply.code(409).send({
+        error: 'contact_sales',
+        detail: `${plan.label} is set up together with us rather than bought online. Send an enquiry and we will get back to you.`,
+      });
+    }
+
     const priceId = config.stripePrices[tier][interval];
     if (!priceId) return reply.code(500).send({ error: 'price_not_configured', detail: `${tier}/${interval}` });
+
+    // Seats are charged as a second line item on top of the base.
+    //
+    // If the tier charges per seat but no seat price is configured, this
+    // REFUSES rather than falling back to the base alone. The fallback would
+    // create a real subscription that silently never bills for seats — money
+    // quietly not collected, on exactly the accounts that grow, discovered
+    // months later. A failed checkout is loud and fixable; a subscription
+    // missing its seat line is neither.
+    const lineItems: { price: string; quantity: number }[] = [{ price: priceId, quantity: 1 }];
+    if (plan.chfPerSeatMonthly > 0) {
+      const seatPrice = config.stripeSeatPrices[tier][interval];
+      if (!seatPrice) {
+        req.log.error({ tier, interval }, 'seat price missing for a per-seat tier — refusing checkout');
+        return reply.code(500).send({
+          error: 'seat_price_not_configured',
+          detail: `${tier}/${interval} bills per seat but no seat price is set up. Checkout is refused rather than billing the base only.`,
+        });
+      }
+      const seats = await currentSeats(req.membership.teamId);
+      const billable = billableSeats(plan, seats);
+      // Quantity 0 is valid and correct for a team inside its included seats —
+      // Stripe accepts a zero-quantity line, and it means the item is there and
+      // ready to grow rather than having to be added later.
+      lineItems.push({ price: seatPrice, quantity: billable });
+    }
 
     const customerId = await ensureStripeCustomer(req.membership.teamId, req.user.email);
     // A live campaign auto-applies its coupon (no code to type). Stripe Checkout
@@ -68,7 +114,7 @@ export default async function billingRoutes(app: FastifyInstance): Promise<void>
     const session = await requireStripe().checkout.sessions.create({
       mode: 'subscription',
       customer: customerId,
-      line_items: [{ price: priceId, quantity: 1 }],
+      line_items: lineItems,
       success_url: `${config.frontendUrl}/app/billing?checkout=success`,
       cancel_url: `${config.frontendUrl}/app/billing?checkout=cancelled`,
       client_reference_id: req.membership.teamId,

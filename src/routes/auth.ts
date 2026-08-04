@@ -10,6 +10,7 @@ import { noteLoginDevice, notifyPasswordChanged } from '../lib/securityEvents.js
 import { verifyTotp } from '../lib/totp.js';
 import { getPlan } from '../plans.js';
 import { SESSION_COOKIE, createSession, establishSession, requireUser, revokeSessions, sessionCookieOptions, signSession } from '../plugins/auth.js';
+import { pushSeats } from '../scheduler/seatSync.js';
 
 const credentialsSchema = {
   type: 'object',
@@ -457,6 +458,10 @@ export default async function authRoutes(app: FastifyInstance): Promise<void> {
       }
       return invites.map((i) => i.team_id);
     });
+    // Verifying an email can accept several pending invites at once, so this is
+    // a loop rather than a single call. Outside the transaction and unawaited,
+    // like every other seat push: the reconciler is the safety net.
+    for (const teamId of joinedTeamIds) void pushSeats(teamId);
     return { ok: true, joinedTeamIds };
   });
 
