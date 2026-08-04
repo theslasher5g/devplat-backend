@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { config, type PlanTier } from '../config.js';
 import { maybeOne, one, query, withTransaction } from '../db.js';
-import { allPlans, getPlan, maxFootprintGb } from '../plans.js';
+import { allPlans, billableSeats, getPlan, maxFootprintGb } from '../plans.js';
 import { resolveTtlMinutes } from '../scheduler/allocator.js';
 import { type AuditRow, auditFromReq, serializeAudit } from '../lib/audit.js';
 import { AUDIT_CSV_HEADER, auditCsvRow, auditFilters } from '../lib/auditExport.js';
@@ -110,15 +110,23 @@ async function requireAuditLogPlan(req: FastifyRequest, reply: FastifyReply): Pr
  * invites that all get accepted later. Returns an error body to send, or null
  * when there's room for `adding` more people.
  */
+/** The tier whose limits apply, which is the manual override when one is set.
+ *  Entitlements follow the override; billing follows plan_tier. Read in one
+ *  place so the two callers cannot disagree about which is which. */
+async function effectiveTier(teamId: string): Promise<PlanTier | null> {
+  const team = await maybeOne<{ plan_tier: PlanTier }>(
+    'SELECT COALESCE(plan_override, plan_tier) AS plan_tier FROM teams WHERE id = $1', [teamId],
+  );
+  return team?.plan_tier ?? null;
+}
+
 async function seatLimitError(
   teamId: string,
   adding: number,
 ): Promise<{ error: string; detail: string } | null> {
-  const team = await maybeOne<{ plan_tier: PlanTier }>(
-    'SELECT COALESCE(plan_override, plan_tier) AS plan_tier FROM teams WHERE id = $1', [teamId],
-  );
-  if (!team) return null;
-  const plan = getPlan(team.plan_tier);
+  const tier = await effectiveTier(teamId);
+  if (!tier) return null;
+  const plan = getPlan(tier);
   if (plan.maxMembers === null) return null; // unlimited tier
 
   const counts = await one<{ members: string; invites: string }>(
@@ -131,9 +139,14 @@ async function seatLimitError(
   if (used + adding <= plan.maxMembers) return null;
   return {
     error: 'seat_limit_reached',
-    detail: `The ${plan.label} plan includes ${plan.maxMembers} seat${plan.maxMembers === 1 ? '' : 's'} `
+    // "allows up to", not "includes". Since seat pricing landed, "included" has
+    // a specific and different meaning — the seats covered by the base price —
+    // and using the same word for the cap contradicts the pricing page at
+    // exactly the point where someone is deciding whether to pay.
+    detail: `The ${plan.label} plan allows up to ${plan.maxMembers} `
+      + `${plan.maxMembers === 1 ? 'person' : 'people'} `
       + `(${counts.members} member${counts.members === '1' ? '' : 's'}, ${counts.invites} pending invite${counts.invites === '1' ? '' : 's'}). `
-      + 'Upgrade the plan to add more people.',
+      + 'Larger teams are set up together with us — send an enquiry from the billing page.',
   };
 }
 
@@ -687,7 +700,41 @@ export default async function teamRoutes(app: FastifyInstance): Promise<void> {
     await sendTeamInviteEmail(normalized, token, team.name, req.user.email, role).catch((err) => {
       req.log.warn({ err }, 'team invite email failed to send');
     });
-    return reply.code(201).send({ ok: true });
+
+    // What this invite will cost, once accepted.
+    //
+    // Since seat pricing landed, inviting the sixth developer to a Team plan
+    // adds CHF 25 to the invoice — and nothing said so at the moment of the
+    // click. A charge that first appears on a statement is the kind that
+    // arrives as a support thread rather than as revenue.
+    //
+    // Reported as a fact about the next invoice, not as a confirmation step:
+    // the invite is already sent. Blocking on "are you sure" would be worse —
+    // an owner adding a colleague is doing the thing we want them to do.
+    //
+    // Counted the same way the biller counts: members plus this pending invite,
+    // against the plan's allowance.
+    // Billing follows plan_tier, not the override — a comped entitlement does
+    // not change what Stripe charges — so this deliberately does NOT use
+    // effectiveTier().
+    const billingTier = await one<{ plan_tier: PlanTier }>(
+      'SELECT plan_tier FROM teams WHERE id = $1', [teamId],
+    );
+    const plan = getPlan(billingTier.plan_tier);
+    let seatCost: { chfPerSeatMonthly: number; billableAfterAccept: number } | null = null;
+    if (plan.chfPerSeatMonthly > 0) {
+      const after = await one<{ n: string }>(
+        `SELECT (SELECT count(*) FROM team_members WHERE team_id = $1)
+              + (SELECT count(*) FROM team_invites
+                  WHERE team_id = $1 AND accepted_at IS NULL AND expires_at > now()) AS n`,
+        [teamId],
+      );
+      seatCost = {
+        chfPerSeatMonthly: plan.chfPerSeatMonthly,
+        billableAfterAccept: billableSeats(plan, Number(after.n)),
+      };
+    }
+    return reply.code(201).send({ ok: true, seatCost });
   });
 
   // Invite details for the accept page (no auth: the token IS the credential).

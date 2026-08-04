@@ -3,7 +3,7 @@ import type { PlanTier } from './config.js';
 // The arithmetic lives in lib/pricing.ts, which has no database import — see
 // the note there. Re-exported so callers keep a single place to reach for.
 export { billableSeats, monthlyCost } from './lib/pricing.js';
-import { nextAvailable } from './lib/pricing.js';
+import { cheapestOffered, nextAvailable } from './lib/pricing.js';
 
 /**
  * Plan/tier data. The `plans` table (migrations/003_plans.sql) is the single
@@ -131,4 +131,22 @@ export function maxFootprintGb(plan: Plan): number {
  *  resolvable for the teams already on them but are never offered again. */
 export function purchasablePlans(): Plan[] {
   return allPlans().filter((p) => p.available);
+}
+
+/**
+ * The entry price: cheapest tier someone leaving the trial can buy themselves.
+ *
+ * Excludes the trial itself (nothing to buy) and sales-led tiers (no price to
+ * quote). Used wherever "plans start at …" appears, so that sentence is read
+ * from the plans table instead of typed into copy — the trial-ending email said
+ * "from CHF 19" long after the entry price became CHF 190, and an email cannot
+ * be corrected once it is sent.
+ *
+ * Throws rather than returning null: a product with nothing to sell is a
+ * misconfiguration worth failing loudly on, not a case for callers to handle.
+ */
+export function cheapestPurchasable(): Plan {
+  const plan = cheapestOffered(allPlans());
+  if (!plan) throw new Error('no self-serve paid plan is available — check the plans table');
+  return plan;
 }

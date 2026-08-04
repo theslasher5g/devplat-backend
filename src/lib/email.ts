@@ -2,6 +2,7 @@ import { render } from '@react-email/render';
 import { Resend } from 'resend';
 import type { ReactElement } from 'react';
 import { config } from '../config.js';
+import { cheapestPurchasable } from '../plans.js';
 import CapacityLimit from '../emails/CapacityLimit.js';
 import ContactSubmission from '../emails/ContactSubmission.js';
 import HostOfflineAlert from '../emails/HostOfflineAlert.js';
@@ -124,7 +125,17 @@ export async function sendTrialEndingEmail(to: string, payload: {
   const subject = payload.daysLeft <= 0
     ? `Your devplat trial for ${payload.teamName} has ended`
     : `${payload.daysLeft} day${payload.daysLeft === 1 ? '' : 's'} left on your devplat trial`;
-  await send(to, subject, TrialEnding({ ...payload, pricingUrl }), pricingUrl);
+  // Read from the plans table rather than written into the template. The entry
+  // price is the one number in this email, it goes to every trialling team, and
+  // it cannot be corrected after sending — so it must not be a copy.
+  const entry = cheapestPurchasable();
+  await send(to, subject, TrialEnding({
+    ...payload,
+    pricingUrl,
+    entryChf: entry.chfMonthly,
+    includedSeats: entry.includedSeats,
+    seatChf: entry.chfPerSeatMonthly,
+  }), pricingUrl);
 }
 
 /** Tells an owner their runs are queueing behind their own parallelism cap.

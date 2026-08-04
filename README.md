@@ -30,8 +30,14 @@ else works.
 STRIPE_SECRET_KEY=sk_test_... npm run stripe:setup
 ```
 
-Creates the Solo/Team/Scale products with monthly + yearly (−17 %) CHF prices
-and prints the six `STRIPE_PRICE_*` env lines. Then point a webhook at
+Reads the `plans` table and creates a product per self-serve paid tier, with
+monthly + yearly (−17 %) CHF prices. Tiers that bill per seat get a second
+product ("— additional developer") so a seat charge is its own invoice line
+rather than part of an opaque total; the script prints both the
+`STRIPE_PRICE_*` and `STRIPE_SEAT_*` env lines. Both are needed —
+`POST /billing/checkout` refuses with `seat_price_not_configured` rather than
+quietly billing the base only. Run migrations first, since the prices come from
+the database. Then point a webhook at
 `https://api.devplat.ch/webhooks/stripe` with events
 `checkout.session.completed`, `customer.subscription.updated`,
 `customer.subscription.deleted`, and put its signing secret into
@@ -191,9 +197,8 @@ regardless of plan.
 `POST /teams` used to give every new team a fresh 14-day trial with no cap on
 how many a person could create. That is not merely "a trial can be extended":
 the free tier grants one parallel environment per team, so ten teams is ten
-concurrent environments — more parallelism than the Solo plan costs CHF 19 a
-month to get. The 10/hour rate limit bounded the speed of the abuse, not the
-abuse.
+concurrent environments — more parallelism than the cheapest paid plan buys.
+The 10/hour rate limit bounded the speed of the abuse, not the abuse.
 
 `users.trial_started_at` (migration 036) makes the trial a property of the
 person. Registration claims it; a later `POST /teams` grants a trial only if it

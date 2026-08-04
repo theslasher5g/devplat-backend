@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { billableSeats, monthlyCost, nextAvailable, seatDrift, type Priced, type SeatState } from '../src/lib/pricing.js';
+import {
+  billableSeats, cheapestOffered, monthlyCost, nextAvailable, seatDrift,
+  type Offered, type Priced, type SeatState,
+} from '../src/lib/pricing.js';
 
 /**
  * Seat pricing is the change that removes the revenue ceiling, which makes it
@@ -144,4 +147,55 @@ test('every remaining tier retired above the current one yields null', () => {
   // Not a theoretical case: retiring Team without replacing it would otherwise
   // hand back a plan that cannot be bought.
   assert.equal(nextAvailable(ORDER, 'free', (t) => t === 'free'), null);
+});
+
+/* ---- the entry price ---- */
+
+// The real catalogue after migration 043, with names so failures read clearly.
+type Named = Offered & { id: string };
+const CATALOGUE: Named[] = [
+  { id: 'free',  chfMonthly: 0,   chfPerSeatMonthly: 0,  includedSeats: 2, selfServe: true,  available: true },
+  { id: 'solo',  chfMonthly: 19,  chfPerSeatMonthly: 0,  includedSeats: 1, selfServe: false, available: false },
+  { id: 'team',  chfMonthly: 190, chfPerSeatMonthly: 25, includedSeats: 5, selfServe: true,  available: true },
+  { id: 'scale', chfMonthly: 249, chfPerSeatMonthly: 0,  includedSeats: 1, selfServe: false, available: true },
+];
+
+test('the entry price is the cheapest tier a customer can actually buy', () => {
+  // Not Solo (retired, and cheaper), not Free (cheapest of all), not Enterprise
+  // (no price to quote). This value is interpolated into the trial-ending email,
+  // which cannot be corrected once sent.
+  assert.equal(cheapestOffered(CATALOGUE)?.id, 'team');
+});
+
+test('the free tier never wins on price', () => {
+  // It is the cheapest by definition. "Plans start at CHF 0" is true and
+  // useless in the sentence this feeds.
+  const onlyFree = CATALOGUE.filter((p) => p.id === 'free');
+  assert.equal(cheapestOffered(onlyFree), null);
+});
+
+test('a retired tier is never quoted, even when it is cheapest', () => {
+  const solo = { ...CATALOGUE[1], selfServe: true };            // cheap, sellable…
+  assert.equal(cheapestOffered([solo, CATALOGUE[2]])?.id, 'team', 'but not available');
+  assert.equal(cheapestOffered([{ ...solo, available: true }, CATALOGUE[2]])?.id, 'solo',
+    'available again — now it is the entry price');
+});
+
+test('a sales-led tier is never quoted', () => {
+  assert.equal(cheapestOffered([CATALOGUE[3]]), null);
+});
+
+test('nothing sellable yields null rather than an invented price', () => {
+  assert.equal(cheapestOffered([]), null);
+  assert.equal(cheapestOffered(CATALOGUE.map((p) => ({ ...p, available: false }))), null);
+});
+
+test('the cheapest is chosen by price, not by list order', () => {
+  const reordered = [...CATALOGUE].reverse();
+  assert.equal(cheapestOffered(reordered)?.id, 'team');
+  const cheaper: Named = {
+    id: 'starter', chfMonthly: 90, chfPerSeatMonthly: 30, includedSeats: 3,
+    selfServe: true, available: true,
+  };
+  assert.equal(cheapestOffered([...CATALOGUE, cheaper])?.id, 'starter');
 });

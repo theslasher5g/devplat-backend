@@ -67,6 +67,34 @@ export function nextAvailable<T>(order: readonly T[], current: T, available: (ti
   return null;
 }
 
+/** The pricing-relevant shape of a plan, plus whether it can still be bought.
+ *  Separate from Priced because monthlyCost() has no business knowing about
+ *  retirement. */
+export interface Offered extends Priced {
+  available: boolean;
+}
+
+/**
+ * The entry price: cheapest thing a customer can actually buy.
+ *
+ * Three exclusions, and each has a way of going wrong quietly:
+ *  - Not available: a retired tier's checkout answers 410, so quoting it sends
+ *    people to a wall.
+ *  - Not self-serve: a negotiated tier has no price to quote.
+ *  - Free: the trial would win on price every time and turn "plans start at
+ *    CHF 190" into "plans start at CHF 0" — technically the cheapest, and
+ *    useless in the sentence it appears in.
+ *
+ * Null when nothing qualifies, so the caller decides whether that is worth
+ * failing on.
+ */
+export function cheapestOffered<T extends Offered>(plans: readonly T[]): T | null {
+  const candidates = plans
+    .filter((p) => p.available && p.selfServe && p.chfMonthly > 0)
+    .sort((a, b) => a.chfMonthly - b.chfMonthly);
+  return candidates[0] ?? null;
+}
+
 export interface SeatState {
   teamId: string;
   tier: PlanTier;
